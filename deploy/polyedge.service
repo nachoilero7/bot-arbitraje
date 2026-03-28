@@ -1,0 +1,18 @@
+[Unit]
+Description=polyedge — Polymarket Edge Scanner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__HOME__/polyedge
+Environment="PATH=__HOME__/polyedge/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
+ExecStart=__HOME__/polyedge/.venv/bin/python main.py
+Restart=always
+RestartSec=15
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
