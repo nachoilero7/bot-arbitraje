@@ -1,0 +1,9 @@
+py-clob-client>=0.17.0
+requests>=2.31.0
+pyyaml>=6.0.1
+python-dotenv>=1.0.0
+rich>=13.7.0
+schedule>=1.2.1
+pandas>=2.1.0
+websockets>=12.0
+scipy>=1.12.0

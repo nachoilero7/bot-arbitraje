@@ -1,0 +1,26 @@
+api:
+  clob_url: "https://clob.polymarket.com"
+  gamma_url: "https://gamma-api.polymarket.com"
+  request_timeout: 10
+  max_retries: 3
+
+scanner:
+  interval_seconds: 5          # Frecuencia de scan
+  max_markets: 5000            # Maximo de mercados a escanear por ciclo
+  min_liquidity_usd: 500       # Liquidez minima USD para considerar un mercado
+
+signals:
+  fee_rate: 0.02               # 2% taker fee de Polymarket
+  min_edge_threshold: 0.03     # Edge minimo requerido (3%) para reportar
+  min_parity_gap: 0.01         # Gap minimo YES+NO < 1.00 para parity signal
+
+sizing:
+  kelly_fraction: 0.25         # Fractional Kelly (25% del Kelly completo)
+  max_position_usd: 50         # Maximo por posicion en Phase 2
+  max_portfolio_usd: 500       # Capital total maximo en juego
+
+logging:
+  level: INFO
+  log_to_file: true
+  log_dir: logs/
+  opportunities_csv: data/opportunities.csv

@@ -1,0 +1,49 @@
+# Credenciales — NUNCA subir
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+
+# Entornos virtuales
+.venv/
+venv/
+env/
+
+# Tests
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDEs
+.idea/
+.vscode/
+
+# Logs y data generada en runtime
+logs/
+data/*.csv
+data/*.json
+
+# Paquetes instalados sueltos en el directorio raíz
+certifi/
+certifi-*.dist-info/
+charset_normalizer/
+charset_normalizer-*.dist-info/
+idna/
+idna-*.dist-info/
+requests/
+requests-*.dist-info/
+urllib3/
+urllib3-*.dist-info/
+bin/
+*.dist-info/
+
+# Análisis / outputs locales
+analysis/
+scripts/
