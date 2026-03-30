@@ -231,6 +231,11 @@ class TradeExecutor:
         if opp.liquidity_usd < 500:
             return False
 
+        # Filtrar mercados con precio >= 0.99 (ya resueltos o en proceso, CLOB rechaza > 0.999)
+        if opp.market_price >= 0.99:
+            logger.debug(f"[EXECUTOR] Skip {opp.condition_id[:12]} — precio {opp.market_price:.4f} demasiado alto (mercado resuelto)")
+            return False
+
         # No repetir el mismo trade
         trade_key = f"{opp.condition_id}:{opp.side}"
         if trade_key in self._executed_ids:
