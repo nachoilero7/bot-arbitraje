@@ -146,6 +146,11 @@ class OrderBookImbalanceSignal(BaseSignal):
             if yes_price <= 0 or yes_price >= 1:
                 continue
 
+            # Ignorar mercados fuera del rango 5%-95%: en longshots el bid imbalance
+            # es estructural (siempre hay mas compradores que vendedores) y no es señal real.
+            if yes_price < 0.05 or yes_price > 0.95:
+                continue
+
             # Parse clobTokenIds
             clob_tokens_raw = market.get("clobTokenIds", "[]")
             if isinstance(clob_tokens_raw, str):
