@@ -303,8 +303,16 @@ class TradeExecutor:
 
         except Exception as e:
             err_str = str(e)
-            logger.error(f"[TRADE ERROR] {opp.condition_id[:12]}: {e}")
-            if "not enough balance" in err_str.lower() or "allowance" in err_str.lower():
+            status  = getattr(e, "status_code", None)
+            err_msg = getattr(e, "error_msg", err_str)
+            logger.error(f"[TRADE ERROR] {opp.condition_id[:12]}: status={status} {err_msg}")
+            if status == 403 or "restricted" in str(err_msg).lower():
+                logger.warning(
+                    "[EXECUTOR] Geoblock 403 detectado — trading restringido en esta region. "
+                    "Activando kill switch. Revisá el proxy en HTTPS_PROXY."
+                )
+                self._daily_loss = self.max_daily_loss_usd
+            elif "not enough balance" in err_str.lower() or "allowance" in err_str.lower():
                 logger.warning(
                     "[EXECUTOR] Balance/allowance insuficiente detectado — "
                     "activando kill switch diario para evitar spam de ordenes fallidas."
