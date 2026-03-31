@@ -238,7 +238,12 @@ class PnLTracker:
         diff = soonest - now
         total_secs = int(diff.total_seconds())
         if total_secs < 0:
-            return "vencido"
+            elapsed = abs(total_secs)
+            if elapsed < 3600:
+                return f"vencio hace {elapsed // 60}m"
+            if elapsed < 86400:
+                return f"vencio hace {elapsed // 3600}h"
+            return f"vencio hace {elapsed // 86400}d"
         if total_secs < 3600:
             return f"{total_secs // 60}m"
         if total_secs < 86400:
