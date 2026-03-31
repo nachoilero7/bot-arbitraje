@@ -22,6 +22,7 @@ from src.signals.spread import SpreadSignal
 from src.signals.longshot_fade import LongshotFadeSignal
 from src.signals.price_drift import PriceDriftSignal
 from src.signals.combinatorial_arb import CombinatorialArbSignal
+from src.signals.calibration_bias import CalibrationBiasSignal
 from src.utils.logger import get_logger
 
 # Enrichers opcionales
@@ -78,11 +79,6 @@ try:
 except ImportError:
     _EXECUTOR_AVAILABLE = False
 
-try:
-    from src.signals.mirofish import MiroFishSignal
-    _MIROFISH_AVAILABLE = True
-except ImportError:
-    _MIROFISH_AVAILABLE = False
 
 logger = get_logger(__name__)
 console = Console(width=160)
@@ -136,10 +132,12 @@ class MarketScanner:
             LongshotFadeSignal(fee_rate=fee_rate, min_edge=min_edge),
             PriceDriftSignal(fee_rate=fee_rate, min_edge=min_edge),
             CombinatorialArbSignal(fee_rate=fee_rate, min_edge=min_edge),
+            CalibrationBiasSignal(fee_rate=fee_rate, min_edge=min_edge),
         ]
         logger.info("LongshotFadeSignal enabled")
         logger.info("PriceDriftSignal enabled")
-        logger.info("CombinatorialArbSignal enabled")
+        logger.info("CombinatorialArbSignal enabled (incl. mutual exclusion detection)")
+        logger.info("CalibrationBiasSignal enabled (SSRN 5910522, 124M trades)")
 
         # The Odds API (H2H — free tier)
         if odds_api_key and _ODDS_AVAILABLE:
@@ -204,14 +202,6 @@ class MarketScanner:
                 min_edge=min_edge,
             ))
             logger.info("NewsSentimentSignal enabled (Finnhub)")
-
-        # MiroFish LLM multi-agent signal (lee del cache generado por MiroFishRunner)
-        if _MIROFISH_AVAILABLE:
-            self.signals.append(MiroFishSignal(
-                fee_rate=fee_rate,
-                min_edge=float(os.getenv("MIROFISH_MIN_EDGE", "0.10")),
-            ))
-            logger.info("MiroFishSignal enabled (LLM multi-agent, reads cache)")
 
         # Telegram notifier
         if telegram_token and telegram_chat_id and _TELEGRAM_AVAILABLE:

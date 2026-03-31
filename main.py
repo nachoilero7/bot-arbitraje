@@ -131,42 +131,17 @@ def main():
         except ImportError:
             pass
 
-        from src.monitors.btc_pnl_tracker import BtcPnlTracker
-        pnl_tracker = BtcPnlTracker(csv_path="data/btc_pnl.csv")
-        pnl_tracker.start()
-
         btc_monitor = BtcArbMonitor(
             executor=executor,
             notifier=notifier,
-            pnl_tracker=pnl_tracker,
-            min_edge=float(os.getenv("MIN_EDGE_BTC", "0.08")),
+            min_edge=float(os.getenv("MIN_EDGE_BTC", "0.09")),
             dry_run=dry_run,
             bankroll_usd=bankroll_usd,
-            proxy=proxy,
-            alchemy_api_key=alchemy_api_key,
         )
         btc_monitor.start()
 
-        # BTC short-window monitor (5-30 min oracle lag) — DESACTIVADO
-        # Razon: sigma microscopico en ventana final genera edges falsos del 47%
-        # que colapsan en la resolucion. Tasa de perdidas: 100%. Ver audit 2026-03-26.
-        # btc_short = BtcShortWindowMonitor(...)
-        # btc_short.start()
-        btc_short = None
-
         mode_str = "DRY RUN" if dry_run else "LIVE"
-        logger.info(f"[BTC ARB] Monitor diario + ventana corta iniciados [{mode_str}]")
-
-    # ── MiroFish Runner ────────────────────────────────────────────────────────
-    # Requiere MiroFish corriendo en localhost:5001 (o MIROFISH_URL)
-    # Setup: git clone https://github.com/666ghj/MiroFish && npm run setup:all && npm run dev
-    mirofish_runner = None
-    try:
-        from src.monitors.mirofish_runner import MiroFishRunner
-        mirofish_runner = MiroFishRunner(proxy=proxy)
-        mirofish_runner.start()
-    except Exception as e:
-        logger.warning(f"[MIROFISH] Runner no iniciado: {e}")
+        logger.info(f"[BTC ARB] Monitor diario iniciado [{mode_str}]")
 
     # ── P&L Tracker ────────────────────────────────────────────────────────────
     pnl_tracker = None
@@ -242,9 +217,6 @@ def main():
 
     if btc_monitor:
         btc_monitor.stop()
-        btc_short.stop() if 'btc_short' in dir() else None
-    if mirofish_runner:
-        mirofish_runner.stop()
 
     console.print("[dim]polyedge stopped.[/dim]")
 

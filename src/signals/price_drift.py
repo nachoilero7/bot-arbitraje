@@ -114,7 +114,7 @@ class PriceDriftSignal(BaseSignal):
 
                     if edge >= self.min_edge:
                         opp = Opportunity(
-                            signal_type=SignalType.RESOLUTION_LAG,
+                            signal_type=SignalType.PRICE_DRIFT,
                             condition_id=cond_id,
                             question=question,
                             category=category,
@@ -155,7 +155,7 @@ class PriceDriftSignal(BaseSignal):
 
                     if edge >= self.min_edge:
                         opp = Opportunity(
-                            signal_type=SignalType.RESOLUTION_LAG,
+                            signal_type=SignalType.PRICE_DRIFT,
                             condition_id=cond_id,
                             question=question,
                             category=category,

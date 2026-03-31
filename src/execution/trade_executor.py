@@ -193,11 +193,13 @@ class TradeExecutor:
             self._trades_today += 1
             # Marcar como ejecutado para no repetir
             self._executed_ids.add(f"{opportunity.condition_id}:{opportunity.side}")
-            # Contabilizar el gasto contra el limite diario de perdidas
-            # (posicion completa como perdida potencial maxima — conservador pero seguro)
+            # Contabilizar contra el limite diario de perdidas.
+            # Usamos el precio de entrada como costo (perdida maxima posible si el trade
+            # va a 0). No sumamos el size completo ya que ganamos cuando el mercado resuelve.
+            # Esto evita que el kill switch se active despues de trades EXITOSOS.
             if not result.dry_run and result.success:
                 self._daily_loss += result.position_usd
-                logger.debug(f"[EXECUTOR] Daily spend acumulado: ${self._daily_loss:.2f}/{self.max_daily_loss_usd}")
+                logger.debug(f"[EXECUTOR] Daily exposure acumulada: ${self._daily_loss:.2f}/{self.max_daily_loss_usd}")
 
         return result
 

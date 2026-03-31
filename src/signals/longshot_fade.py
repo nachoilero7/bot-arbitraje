@@ -52,10 +52,12 @@ class LongshotFadeSignal(BaseSignal):
                 spread     = market.get("spread") or 0
 
                 # Condiciones de mercado blando (aplica a ambos casos)
+                # Mercado blando: bajo volumen O baja liquidez, con spread minimo
+                # AND era demasiado restrictivo — OR captura mercados ineficientes reales
                 soft_market = (
-                    volume_24h < MAX_VOLUME_24H
-                    and liquidity < MAX_LIQUIDITY
+                    (volume_24h < MAX_VOLUME_24H or liquidity < MAX_LIQUIDITY)
                     and spread > MIN_SPREAD
+                    and liquidity > 100  # descartar mercados sin liquidez real
                 )
                 if not soft_market:
                     continue

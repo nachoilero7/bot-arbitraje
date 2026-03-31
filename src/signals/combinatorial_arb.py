@@ -69,8 +69,11 @@ class CombinatorialArbSignal(BaseSignal):
         # Tipo 1: paridad intra-mercado
         opportunities.extend(self._detect_parity_violations(markets))
 
-        # Tipo 2: constraint violations entre mercados relacionados
+        # Tipo 2: constraint violations entre mercados relacionados (thresholds numericos)
         opportunities.extend(self._detect_constraint_violations(markets))
+
+        # Tipo 3: mercados mutuamente excluyentes que suman > 1.0
+        opportunities.extend(self._detect_mutual_exclusion_violations(markets))
 
         opportunities.sort(key=lambda o: o.edge, reverse=True)
         return opportunities
@@ -282,6 +285,105 @@ class CombinatorialArbSignal(BaseSignal):
                 break  # un patron por mercado es suficiente
 
         return groups
+
+    # ── Tipo 3: Mercados mutuamente excluyentes (suma > 1.0) ───────────────────
+
+    def _detect_mutual_exclusion_violations(self, markets: list[dict]) -> list[Opportunity]:
+        """
+        Detecta grupos de mercados mutuamente excluyentes donde la suma de
+        probabilidades supera 1.0, indicando que al menos uno esta sobrevaluado.
+
+        Ejemplo: 'Next PM of Hungary: Orban=0.38, Magyar=0.65' → suma=1.03 → violation
+
+        Agrupa mercados por la 'pregunta base' (removiendo nombres propios y
+        variantes especificas), luego verifica si la suma excede 1.0 + buffer de fees.
+        """
+        opportunities = []
+
+        # Agrupar mercados por pregunta base (sin el sujeto especifico)
+        groups: dict[str, list] = defaultdict(list)
+
+        for market in markets:
+            question = market.get("question", "")
+            if not question:
+                continue
+            volume = market.get("volume24hr") or 0
+            if volume < MIN_VOLUME_CONSTRAINT:
+                continue
+
+            outcome_prices_raw = market.get("outcomePrices")
+            if not outcome_prices_raw:
+                continue
+            try:
+                prices_list = json.loads(outcome_prices_raw) if isinstance(outcome_prices_raw, str) else outcome_prices_raw
+                yes_price = float(prices_list[0]) if prices_list else 0
+                if yes_price <= 0 or yes_price >= 1:
+                    continue
+            except Exception:
+                continue
+
+            # Clave de agrupacion: remover palabras en mayuscula (nombres propios)
+            # y quedarse con la estructura de la pregunta
+            base = re.sub(r'\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*\b', 'NAME', question)
+            base = re.sub(r'\s+', ' ', base).strip().lower()[:100]
+
+            if not base or len(base) < 15:
+                continue
+
+            groups[base].append({
+                "market":    market,
+                "yes_price": yes_price,
+                "question":  question,
+            })
+
+        for base_q, group in groups.items():
+            if len(group) < 2:
+                continue
+
+            total_prob = sum(m["yes_price"] for m in group)
+
+            # Violacion: suma de probabilidades supera 1.0 + 2 fees (arbitrage neto positivo)
+            edge = total_prob - 1.0 - 2 * self.fee_rate
+            if edge < self.min_edge:
+                continue
+
+            # Señalizar el mercado con mayor precio (el mas sobrevaluado del grupo)
+            most_overpriced = max(group, key=lambda x: x["yes_price"])
+            market = most_overpriced["market"]
+            token_ids = json.loads(market.get("clobTokenIds", "[]")) if isinstance(market.get("clobTokenIds"), str) else []
+            no_token = token_ids[1] if len(token_ids) > 1 else ""
+            no_price = 1.0 - most_overpriced["yes_price"]
+            fair_no  = no_price - edge  # el NO del mas caro deberia ser mayor
+
+            opp = Opportunity(
+                signal_type=SignalType.MISPRICED_CORR,
+                condition_id=market.get("conditionId", ""),
+                question=market.get("question", ""),
+                category=self._get_category(market),
+                token_id=no_token,
+                side="NO",
+                market_price=no_price,
+                fair_value=round(fair_no, 5),
+                edge=round(edge, 5),
+                edge_pct=round(edge / no_price, 4) if no_price > 0 else 0,
+                best_bid=market.get("bestBid") or 0,
+                best_ask=market.get("bestAsk") or 0,
+                spread=market.get("spread") or 0,
+                liquidity_usd=market.get("liquidityNum") or 0,
+                volume_24h=market.get("volume24hr") or 0,
+                notes=(
+                    f"MUTUAL EXCLUSION | grupo={len(group)} mercados | "
+                    f"suma_probs={total_prob:.3f} > 1.0 | edge={edge:.4f} | "
+                    f"mercados: {[m['question'][:30] for m in group]}"
+                ),
+            )
+            opportunities.append(opp)
+            logger.info(
+                f"[COMB_ARB] Mutual exclusion violation | {len(group)} markets | "
+                f"sum={total_prob:.3f} edge={edge:.4f} | base='{base_q[:50]}'"
+            )
+
+        return opportunities
 
     def _get_category(self, market: dict) -> str:
         events = market.get("events")

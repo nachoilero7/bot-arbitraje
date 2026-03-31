@@ -68,7 +68,9 @@ class OrderBookImbalanceSignal(BaseSignal):
         self, levels: list[dict], reference_price: float, side: str, window: float = 0.03
     ) -> float:
         """
-        Sum sizes for levels within `window` cents of the reference price.
+        Sum sizes for levels within `window` of the reference price.
+        Window is dynamic: max(3%, half the bid-ask spread) to capture real depth
+        in markets with wide spreads without ignoring valid pressure.
 
         For bids:  reference_price - window <= price <= reference_price
         For asks:  reference_price <= price <= reference_price + window
@@ -191,8 +193,10 @@ class OrderBookImbalanceSignal(BaseSignal):
                 except (KeyError, ValueError):
                     pass
 
-            bid_depth = self._compute_depth(bids, ob_best_bid, side="bid")
-            ask_depth = self._compute_depth(asks, ob_best_ask, side="ask")
+            # Ventana dinamica: max(3%, mitad del spread) — captura depth real en mercados con spread amplio
+            dynamic_window = max(0.03, (ob_best_ask - ob_best_bid) * 0.5) if ob_best_ask > ob_best_bid else 0.03
+            bid_depth = self._compute_depth(bids, ob_best_bid, side="bid", window=dynamic_window)
+            ask_depth = self._compute_depth(asks, ob_best_ask, side="ask", window=dynamic_window)
             total_depth = bid_depth + ask_depth
 
             if total_depth <= 0:

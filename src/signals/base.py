@@ -10,12 +10,13 @@ from typing import Optional
 
 
 class SignalType(str, Enum):
-    PARITY         = "PARITY"          # YES + NO < $1 (arbitrage puro)
-    SPREAD_CAPTURE = "SPREAD_CAPTURE"  # Bid-ask spread amplio, market making
-    OVERPRICED_NO  = "OVERPRICED_NO"   # NO sobrevaluado vs probabilidad base
-    RESOLUTION_LAG = "RESOLUTION_LAG"  # Mercado lento actualizando outcome claro
-    MISPRICED_CORR = "MISPRICED_CORR"  # Mercados correlacionados con precio incoherente
-    MIROFISH       = "MIROFISH"        # LLM multi-agente: gap entre consenso LLM y precio
+    PARITY           = "PARITY"           # YES + NO < $1 (arbitrage puro)
+    SPREAD_CAPTURE   = "SPREAD_CAPTURE"   # Bid-ask spread amplio, market making
+    OVERPRICED_NO    = "OVERPRICED_NO"    # NO sobrevaluado vs probabilidad base
+    RESOLUTION_LAG   = "RESOLUTION_LAG"   # Mercado lento actualizando outcome claro
+    MISPRICED_CORR   = "MISPRICED_CORR"   # Mercados correlacionados con precio incoherente
+    PRICE_DRIFT      = "PRICE_DRIFT"      # Momentum/mean-reversion por movimiento consistente
+    CALIBRATION_BIAS = "CALIBRATION_BIAS" # Sesgo de calibracion documentado (SSRN 5910522, 124M trades)
 
 
 @dataclass

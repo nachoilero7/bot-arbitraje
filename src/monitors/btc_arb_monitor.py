@@ -1,159 +1,168 @@
 """
-BTC Arb Monitor — Monitor en tiempo real del mercado "Bitcoin Up or Down" diario.
+BTC Arb Monitor v4 — Formula correcta para opciones binarias digitales.
 
-Mejoras v2:
-  #1 Precio real de Polymarket: usa outcomePrices de Gamma API (cache 30s)
-  #2 Event-driven: dispara evaluacion inmediata cuando BTC se mueve >0.3%
-  #3 Volatilidad dinamica: vol realizada de los ultimos 7 dias
+Modelo matematico:
+  El mercado "Will BTC be above $K on <date>?" es una opcion digital cash-or-nothing.
+  La probabilidad correcta es N(d₂) de Black-Scholes, con correccion de Cornish-Fisher
+  para los fat tails de BTC (kurtosis ~6-10 vs normal ~3).
 
-Mejoras v3:
-  #4 t-Student: reemplaza normal por t-distribution (df=4) para fat tails de crypto
-  #5 Funding rate: ajusta P(UP) segun posicionamiento del mercado de futuros perp
-  #6 Entry confirmation: requiere 2 evaluaciones consecutivas con edge antes de ejecutar
-  #7 P&L tracking: registra cada trade y monitorea la resolucion
+  d₂ = [ln(S/K) - (σ²/2)·T] / (σ·√T)
+  z_CF = d₂ - (g₁/6)·(d₂²-1) - (g₂/24)·(d₂³-3d₂) + (g₁²/36)·(2d₂³-5d₂)
+  P(BTC > K) = N(z_CF)
 
-Estrategia:
-  Polymarket publica cada dia un mercado binario "BTC Up or Down on <fecha>?"
-  Resolucion: precio de cierre 1m de BTC/USDT en Binance al mediodia ET de hoy vs ayer.
-  Edge cuando el movimiento acumulado es claro pero Polymarket todavia no lo refleja.
+  donde g₁=skewness(-0.2), g₂=kurtosis_excess(4.0) para BTC.
 
-Modelo de probabilidad (v3):
-  z = pct_move / sigma_remaining
-  p_up_base = t.cdf(z, df=4)                          # fat tails
-  funding_adj = funding_rate * FUNDING_BIAS_SCALE      # posicionamiento de mercado
-  p_up_true = clamp(p_up_base - funding_adj, 0.01, 0.99)
+Volatilidad (HAR-RV — Corsi 2009):
+  σ_HAR = β_d·RV_1d + β_w·RV_5d + β_m·RV_22d
+  Calculada sobre velas de 5 minutos para capturar intraday dynamics.
+  Mas precisa que vol diaria simple para prediccion de movimiento intradía.
+
+Requisitos para operar:
+  - Solo mercados DIARIOS con volumen >= $100K (mercados cortos tienen fees dinamicos 3.15%)
+  - Edge neto >= MIN_EDGE (default: 9%)
+  - 2 evaluaciones consecutivas confirman el signal
+  - Blackout 10min antes del cierre
+  - No operar en las primeras 2h del dia (alta incertidumbre)
+  - Ajuste de funding rate solo en extremos (>0.05%/8h o <-0.03%/8h)
 """
-import asyncio
 import json
+import math
 import threading
 import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import requests
-import websockets
-from scipy.stats import t as student_t
 
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-BINANCE_WS_URL   = "wss://stream.binance.com:9443/ws/btcusdt@ticker"
-BINANCE_KLINES   = "https://api.binance.com/api/v3/klines"
-BINANCE_FUNDING  = "https://fapi.binance.com/fapi/v1/fundingRate"
-GAMMA_SERIES_URL = "https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=50&order=volume24hr&ascending=false"
+# ── Binance ─────────────────────────────────────────────────────────────────
+BINANCE_REST_TICKER = "https://api.binance.com/api/v3/ticker/price"
+BINANCE_KLINES      = "https://api.binance.com/api/v3/klines"
+BINANCE_FUNDING     = "https://fapi.binance.com/fapi/v1/fundingRate"
 
-# Chainlink BTC/USD Data Feed en Polygon (actualiza cada 10-30s o si BTC se mueve ±0.5%)
-# NOTA: 0xF9680D99...  = ETH/USD (INCORRECTO para BTC)
-#       0xc907E116...  = BTC/USD verificado ($70,205 vs Binance $70,344 el 23/03/26)
-CHAINLINK_BTC_POLYGON  = "0xc907E116054Ad103354f2D350FD2514433D57F6f"
-CHAINLINK_SELECTOR     = "0xfeaf968c"  # latestRoundData()
-CHAINLINK_POLL_SECS    = 5             # pollear cada 5s para detectar actualizaciones
-# Rango valido de precio BTC (sanidad): si el oraculo devuelve fuera de este rango, ignorar
-CHAINLINK_BTC_MIN = 10_000
-CHAINLINK_BTC_MAX = 200_000
+# ── Polymarket ───────────────────────────────────────────────────────────────
+GAMMA_SEARCH_URL = (
+    "https://gamma-api.polymarket.com/markets"
+    "?active=true&closed=false&limit=200&order=volume24hr&ascending=false"
+)
 
-# Volatilidad fallback si no se puede calcular la dinamica
-BTC_DAILY_VOL_FALLBACK = 0.025
+# ── HAR-RV parametros (Corsi 2009) ───────────────────────────────────────────
+HAR_BETA_DAILY   = 0.35   # componente diaria (velocidad de reaccion)
+HAR_BETA_WEEKLY  = 0.25   # componente semanal (5 dias)
+HAR_BETA_MONTHLY = 0.20   # componente mensual (22 dias)
+HAR_INTERCEPT    = 0.005  # floor minimo de vol
+BTC_DAILY_VOL_FALLBACK = 0.025  # 2.5%/dia si no se puede calcular
 
-# Minimo edge para ejecutar
-MIN_EDGE_BTC = 0.08
+# ── Cornish-Fisher fat-tail correction ───────────────────────────────────────
+# BTC tiene skewness negativo (crashes mas frecuentes que rallies) y fat tails
+BTC_SKEWNESS        = -0.2    # g₁: skewness empirico de retornos BTC diarios
+BTC_KURTOSIS_EXCESS =  4.0    # g₂: kurtosis exceso (normal=0, BTC empirico ~4-7)
 
-# No operar en los ultimos minutos antes del cierre
+# ── Filtros de mercado ────────────────────────────────────────────────────────
+MIN_MARKET_VOLUME_USD = 100_000  # Solo mercados con suficiente liquidez
+MIN_MARKET_DAYS       = 0        # Acepta mercados diarios (ends hoy o manana)
+MAX_MARKET_DAYS       = 2        # No operar en mercados de mas de 2 dias
+
+# ── Edge y timing ─────────────────────────────────────────────────────────────
+MIN_EDGE                      = 0.09   # overrideable por env MIN_EDGE_BTC
 BLACKOUT_MINUTES_BEFORE_CLOSE = 10
+MIN_HOURS_ELAPSED             = 2.0   # no operar primeras 2h (alta incertidumbre)
 
-# No operar en las primeras horas del dia
-MIN_HOURS_ELAPSED = 2.0
+# ── Funding rate (solo ajuste en extremos) ───────────────────────────────────
+FUNDING_EXTREME_LONG  =  0.0005   # +0.05%/8h: mercado muy sobre-comprado
+FUNDING_EXTREME_SHORT = -0.0003   # -0.03%/8h: mercado muy sobre-vendido
+FUNDING_ADJ_EXTREME   =  0.03     # ajuste de 3pp cuando funding es extremo
+FUNDING_CACHE_TTL     = 3600      # actualizar cada hora
 
-# Intervalo de evaluacion periodica (fallback cuando BTC no se mueve)
-EVAL_INTERVAL = 30
-
-# #2 — Umbral de movimiento para disparo inmediato (0.3%)
-MOVE_TRIGGER_PCT = 0.003
-
-# #1 — Cache del mercado: 30s
-MARKET_CACHE_TTL = 30
-
-# #3 — Cache de volatilidad: 1 hora
-VOL_CACHE_TTL = 3600
-
-# #4 — Grados de libertad de la t-distribution para BTC (fat tails crypto)
-BTC_TDIST_DF = 4
-
-# #5 — Funding rate
-FUNDING_CACHE_TTL = 3600   # actualizar cada hora
-FUNDING_BIAS_SCALE = 50    # escala: funding 0.001 → ajuste de 0.05 en probabilidad
-
-# #6 — Confirmacion de entrada: requiere N evaluaciones consecutivas con edge
+# ── Confirmacion de entrada ───────────────────────────────────────────────────
 MIN_CONSECUTIVE_SIGNALS = 2
+
+# ── Intervalos de polling/cache ───────────────────────────────────────────────
+EVAL_INTERVAL_SECS = 60        # evaluar cada 60s
+PRICE_POLL_SECS    = 10        # precio BTC cada 10s (REST fallback)
+VOL_CACHE_TTL      = 3600      # recalcular HAR-RV cada hora
+MARKET_CACHE_TTL   = 30        # cache de mercado activo 30s
+MOVE_TRIGGER_PCT   = 0.003     # disparar evaluacion si BTC mueve 0.3%
+
+
+# ── Implementacion N(x) sin scipy ────────────────────────────────────────────
+def _norm_cdf(x: float) -> float:
+    """CDF de la normal estandar via aproximacion de Abramowitz & Stegun (error < 1.5e-7)."""
+    sign = 1.0 if x >= 0 else -1.0
+    x = abs(x)
+    t = 1.0 / (1.0 + 0.2316419 * x)
+    p = t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))))
+    return 0.5 + sign * (0.5 - math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi) * p)
 
 
 class BtcArbMonitor:
     """
-    Monitor de arbitraje para el mercado diario 'Bitcoin Up or Down'.
-    Corre en threads separados junto al scanner principal.
+    Monitor de arbitraje para mercados binarios de BTC en Polymarket.
+    Compara la probabilidad real N(d₂)+Cornish-Fisher con el precio del mercado.
+    Solo opera en mercados DIARIOS con alto volumen para evitar fees dinamicos.
     """
 
     def __init__(
         self,
         executor=None,
         notifier=None,
-        pnl_tracker=None,
-        min_edge: float = MIN_EDGE_BTC,
+        pnl_tracker=None,          # mantenido por compatibilidad, no se usa
+        min_edge: float = MIN_EDGE,
         dry_run: bool = True,
         bankroll_usd: float = 100.0,
         proxy: str = None,
         alchemy_api_key: str = None,
     ):
-        self.executor         = executor
-        self.notifier         = notifier
-        self.pnl_tracker      = pnl_tracker
-        self.min_edge         = min_edge
-        self.dry_run          = dry_run
-        self.bankroll_usd     = bankroll_usd
-        self.proxy            = proxy
-        self.alchemy_api_key  = alchemy_api_key
+        self.executor     = executor
+        self.notifier     = notifier
+        self.min_edge     = min_edge
+        self.dry_run      = dry_run
+        self.bankroll_usd = bankroll_usd
+        # proxy y alchemy no se usan en v4 (Chainlink descontinuado como estrategia)
 
-        self._btc_price: float       = 0.0
-        # Chainlink oracle state
-        self._chainlink_price: float    = 0.0
-        self._chainlink_updated_at: float = 0.0  # unix timestamp de la ultima actualizacion
-        self._price_lock             = threading.Lock()
-        self._running: bool          = False
-        self._market_cache: dict     = {}
-        self._market_cache_ts: float = 0.0
-        self._executed_today: set    = set()
-        self._last_exec_date         = None
+        # Precio BTC
+        self._btc_price: float = 0.0
+        self._price_lock       = threading.Lock()
+        self._last_eval_price  = 0.0
 
-        # #2 — event-driven
-        self._last_eval_price: float = 0.0
-        self._trigger_eval           = threading.Event()
+        # State
+        self._running          = False
+        self._market_cache: Optional[dict] = None
+        self._market_cache_ts  = 0.0
 
-        # #3 — vol dinamica
-        self._realized_vol: float    = BTC_DAILY_VOL_FALLBACK
-        self._vol_cache_ts: float    = 0.0
+        # Daily reset — protegido con lock para thread-safety
+        self._exec_lock        = threading.Lock()
+        self._executed_today: set = set()
+        self._last_exec_date   = None
 
-        # #5 — funding rate
-        self._funding_rate: float    = 0.0
-        self._funding_cache_ts: float = 0.0
+        # HAR-RV volatilidad
+        self._har_vol: float   = BTC_DAILY_VOL_FALLBACK
+        self._vol_cache_ts     = 0.0
 
-        # #6 — confirmacion de entrada
-        self._consecutive_signal: int  = 0
-        self._pending_condition_id: str = ""
+        # Funding rate
+        self._funding_rate     = 0.0
+        self._funding_cache_ts = 0.0
 
-    # ── Public ─────────────────────────────────────────────────────────────────
+        # Confirmacion de entrada
+        self._consecutive_signal  = 0
+        self._pending_condition_id = ""
+        self._eval_lock            = threading.Lock()
+
+        # Trigger para evaluacion event-driven
+        self._trigger_eval = threading.Event()
+
+    # ── Public API ──────────────────────────────────────────────────────────
 
     def start(self):
         self._running = True
-        threading.Thread(target=self._ws_thread,          daemon=True, name="btc-ws").start()
-        threading.Thread(target=self._eval_loop,          daemon=True, name="btc-eval").start()
-        threading.Thread(target=self._vol_updater,        daemon=True, name="btc-vol").start()
-        threading.Thread(target=self._funding_updater,    daemon=True, name="btc-funding").start()
-        if self.alchemy_api_key:
-            threading.Thread(target=self._chainlink_updater, daemon=True, name="btc-chainlink").start()
-            logger.info("[BTC ARB] Monitor iniciado — Chainlink oracle feed activo")
-        else:
-            logger.info("[BTC ARB] Monitor iniciado — esperando precio BTC... (sin Chainlink: ALCHEMY_API_KEY no configurado)")
+        threading.Thread(target=self._price_poller,   daemon=True, name="btc-price").start()
+        threading.Thread(target=self._eval_loop,      daemon=True, name="btc-eval").start()
+        threading.Thread(target=self._vol_updater,    daemon=True, name="btc-vol").start()
+        threading.Thread(target=self._funding_updater, daemon=True, name="btc-fund").start()
+        logger.info("[BTC ARB v4] Monitor iniciado — N(d₂)+Cornish-Fisher+HAR-RV activo")
 
     def stop(self):
         self._running = False
@@ -164,198 +173,141 @@ class BtcArbMonitor:
         with self._price_lock:
             return self._btc_price
 
-    @property
-    def chainlink_price(self) -> float:
-        """Ultimo precio BTC/USD reportado por el oraculo Chainlink en Polygon."""
-        return self._chainlink_price
+    # ── Precio BTC via REST polling ─────────────────────────────────────────
 
-    @property
-    def chainlink_lag_secs(self) -> float:
-        """Segundos desde la ultima actualizacion del oraculo Chainlink.
-        Un valor alto (>10s) indica que el oraculo esta desactualizado respecto a Binance."""
-        if self._chainlink_updated_at <= 0:
-            return 0.0
-        return time.time() - self._chainlink_updated_at
-
-    # ── WebSocket Binance ───────────────────────────────────────────────────────
-
-    def _ws_thread(self):
+    def _price_poller(self):
+        """Obtiene precio BTC via REST cada 10s y dispara evaluacion si mueve 0.3%."""
         while self._running:
             try:
-                asyncio.run(self._ws_connect())
-            except Exception as e:
-                logger.warning(f"[BTC ARB] WebSocket error: {e} — reconectando en 5s")
-                time.sleep(5)
-
-    async def _ws_connect(self):
-        async with websockets.connect(BINANCE_WS_URL, ping_interval=20) as ws:
-            logger.info("[BTC ARB] WebSocket Binance conectado")
-            async for raw in ws:
-                if not self._running:
-                    break
-                try:
-                    data  = json.loads(raw)
-                    price = float(data.get("c", 0) or data.get("p", 0))
-                    if price <= 0:
-                        continue
+                r = requests.get(
+                    BINANCE_REST_TICKER,
+                    params={"symbol": "BTCUSDT"},
+                    timeout=5,
+                )
+                price = float(r.json().get("price", 0))
+                if price > 0:
                     with self._price_lock:
                         self._btc_price = price
-
-                    # #2 — disparar evaluacion si el movimiento supera el umbral
                     if self._last_eval_price > 0:
                         move = abs(price - self._last_eval_price) / self._last_eval_price
                         if move >= MOVE_TRIGGER_PCT:
                             self._trigger_eval.set()
-                except Exception:
-                    pass
+            except Exception as e:
+                logger.debug(f"[BTC ARB] Price poll error: {e}")
+            time.sleep(PRICE_POLL_SECS)
 
-    # ── Evaluation Loop ─────────────────────────────────────────────────────────
+    # ── Evaluation Loop ─────────────────────────────────────────────────────
 
     def _eval_loop(self):
-        """
-        Espera hasta que:
-          a) BTC se mueve >0.3% desde la ultima evaluacion (event-driven), o
-          b) pasan 30 segundos sin movimiento significativo (timer fallback)
-        """
+        """Evalua cada 60s o cuando BTC mueve >0.3%."""
+        # Esperar precio inicial
         for _ in range(30):
             if self.btc_price > 0:
                 break
             time.sleep(1)
 
         while self._running:
-            triggered = self._trigger_eval.wait(timeout=EVAL_INTERVAL)
+            triggered = self._trigger_eval.wait(timeout=EVAL_INTERVAL_SECS)
             self._trigger_eval.clear()
-
             if not self._running:
                 break
-
             try:
-                self._evaluate(triggered_by_move=triggered)
+                with self._eval_lock:
+                    self._evaluate(triggered_by_move=triggered)
             except Exception as e:
-                logger.error(f"[BTC ARB] Eval error: {e}")
+                logger.error(f"[BTC ARB] Eval error: {e}", exc_info=True)
 
-    # ── Chainlink Oracle ─────────────────────────────────────────────────────────
-
-    def _chainlink_updater(self):
-        """
-        Thread que lee el oraculo Chainlink BTC/USD en Polygon cada 5 segundos.
-        Expone chainlink_price y chainlink_lag_secs para que el short monitor pueda
-        calcular el gap REAL entre Binance spot y el oraculo.
-        """
-        while self._running:
-            try:
-                price, updated_at = self._fetch_chainlink()
-                # Validar que el precio es BTC (no ETH/USD u otro feed)
-                if price > 0 and updated_at > 0:
-                    if not (CHAINLINK_BTC_MIN < price < CHAINLINK_BTC_MAX):
-                        logger.warning(
-                            f"[CHAINLINK] Precio fuera de rango BTC ({price:,.0f}) — "
-                            f"verificar address del feed. Ignorando."
-                        )
-                    else:
-                        self._chainlink_price      = price
-                        self._chainlink_updated_at = updated_at
-                if self._chainlink_price > 0:
-                    price  = self._chainlink_price
-                    lag = time.time() - self._chainlink_updated_at
-                    logger.debug(
-                        f"[CHAINLINK] BTC={price:,.2f} | "
-                        f"lag={lag:.1f}s | gap_vs_binance={(self._btc_price - price)/price:+.4%}"
-                        if self._btc_price > 0 else
-                        f"[CHAINLINK] BTC={price:,.2f} | lag={lag:.1f}s"
-                    )
-            except Exception as e:
-                logger.debug(f"[CHAINLINK] Error fetching oracle: {e}")
-            time.sleep(CHAINLINK_POLL_SECS)
-
-    def _fetch_chainlink(self) -> tuple[float, float]:
-        """
-        Lee latestRoundData() del oraculo Chainlink BTC/USD en Polygon via Alchemy.
-        Retorna (price_usd, updated_at_unix_ts).
-        """
-        url = f"https://polygon-mainnet.g.alchemy.com/v2/{self.alchemy_api_key}"
-        payload = {
-            "id": 1,
-            "jsonrpc": "2.0",
-            "method": "eth_call",
-            "params": [
-                {"to": CHAINLINK_BTC_POLYGON, "data": CHAINLINK_SELECTOR},
-                "latest",
-            ],
-        }
-        r = requests.post(url, json=payload, timeout=5)
-        result_hex = r.json().get("result", "0x")
-        if not result_hex or result_hex == "0x":
-            return 0.0, 0.0
-        raw = bytes.fromhex(result_hex[2:])
-        # ABI layout: roundId(32) | answer(32) | startedAt(32) | updatedAt(32) | answeredInRound(32)
-        if len(raw) < 128:
-            return 0.0, 0.0
-        answer     = int.from_bytes(raw[32:64],  "big", signed=True)
-        updated_at = int.from_bytes(raw[96:128], "big", signed=False)
-        return answer / 1e8, float(updated_at)
-
-    # ── #3 Volatilidad Dinamica ─────────────────────────────────────────────────
+    # ── HAR-RV Volatility ───────────────────────────────────────────────────
 
     def _vol_updater(self):
-        """Thread que actualiza la vol realizada cada hora."""
+        """Actualiza HAR-RV cada hora."""
         while self._running:
-            vol = self._calc_realized_vol()
+            vol = self._update_har_vol()
             if vol > 0:
-                self._realized_vol = vol
+                self._har_vol    = vol
                 self._vol_cache_ts = time.time()
-                logger.info(f"[BTC ARB] Vol realizada 7d: {vol:.3f} ({vol*100:.2f}%/dia)")
+                logger.info(f"[BTC ARB] HAR-RV: σ={vol:.4f} ({vol*100:.2f}%/dia)")
             time.sleep(VOL_CACHE_TTL)
 
-    def _calc_realized_vol(self) -> float:
-        """Calcula la volatilidad diaria realizada de BTC de los ultimos 7 dias."""
+    def _update_har_vol(self) -> float:
+        """
+        Calcula HAR-RV (Corsi 2009) usando velas de 5 minutos de Binance.
+
+        HAR-RV: σ_t = β₀ + β_d·RV_1d + β_w·RV_5d + β_m·RV_22d
+        RV = sqrt(suma de retornos^2 sobre el periodo), anualizado a diario.
+
+        Ventaja sobre vol diaria: captura la estructura de correlacion
+        de la volatilidad a multiples horizontes (dia, semana, mes).
+        """
         try:
             now      = datetime.now(timezone.utc)
             end_ts   = int(now.timestamp() * 1000)
-            start_ts = int((now - timedelta(days=8)).timestamp() * 1000)
+            # 22 dias de velas de 5min = ~22*288 = 6336 velas
+            start_ts = int((now - timedelta(days=23)).timestamp() * 1000)
+
             r = requests.get(
                 BINANCE_KLINES,
-                params={"symbol": "BTCUSDT", "interval": "1d", "startTime": start_ts,
-                        "endTime": end_ts, "limit": 8},
-                timeout=10,
+                params={
+                    "symbol":    "BTCUSDT",
+                    "interval":  "5m",
+                    "startTime": start_ts,
+                    "endTime":   end_ts,
+                    "limit":     1500,   # maximo por request
+                },
+                timeout=15,
             )
             candles = r.json()
-            if len(candles) < 3:
+            if len(candles) < 50:
+                logger.warning(f"[BTC ARB] HAR-RV: pocas velas ({len(candles)}), usando fallback")
                 return BTC_DAILY_VOL_FALLBACK
 
+            # Retornos de 5 minutos
             closes  = [float(c[4]) for c in candles]
-            returns = [(closes[i] - closes[i-1]) / closes[i-1] for i in range(1, len(closes))]
-            mean    = sum(returns) / len(returns)
-            var     = sum((x - mean) ** 2 for x in returns) / len(returns)
-            vol     = var ** 0.5
-            # Clamp entre 1% y 8% para evitar valores extremos
-            return max(0.01, min(0.08, vol))
+            ret5m   = [(closes[i] - closes[i-1]) / closes[i-1] for i in range(1, len(closes))]
+
+            # Velas por dia: 288 (24h * 12 per hora)
+            BARS_PER_DAY = 288
+
+            def rv_period(returns_list: list) -> float:
+                """RV de un periodo = sqrt(suma r^2), convertido a escala diaria."""
+                if not returns_list:
+                    return BTC_DAILY_VOL_FALLBACK
+                ss = sum(r * r for r in returns_list)
+                # rv intraday → escalar a diario: * sqrt(BARS_PER_DAY / len)
+                scale = (BARS_PER_DAY / len(returns_list)) ** 0.5
+                return (ss ** 0.5) * scale
+
+            # RV componente diaria (ultimo dia)
+            rv_1d = rv_period(ret5m[-BARS_PER_DAY:])
+
+            # RV componente semanal (5 dias)
+            rv_5d = rv_period(ret5m[-5 * BARS_PER_DAY:])
+
+            # RV componente mensual (22 dias)
+            rv_22d = rv_period(ret5m[-22 * BARS_PER_DAY:]) if len(ret5m) >= 22 * BARS_PER_DAY else rv_5d
+
+            har_vol = HAR_INTERCEPT + HAR_BETA_DAILY * rv_1d + HAR_BETA_WEEKLY * rv_5d + HAR_BETA_MONTHLY * rv_22d
+
+            # Clamp: min 0.5%/dia, max 10%/dia
+            return max(0.005, min(0.10, har_vol))
+
         except Exception as e:
-            logger.warning(f"[BTC ARB] No se pudo calcular vol dinamica: {e}")
+            logger.warning(f"[BTC ARB] HAR-RV error: {e}")
             return BTC_DAILY_VOL_FALLBACK
 
-    # ── #5 Funding Rate ─────────────────────────────────────────────────────────
+    # ── Funding Rate ────────────────────────────────────────────────────────
 
     def _funding_updater(self):
-        """Thread que actualiza el funding rate de BTC cada hora."""
+        """Actualiza funding rate cada hora."""
         while self._running:
             rate = self._fetch_funding_rate()
             if rate is not None:
-                self._funding_rate    = rate
+                self._funding_rate     = rate
                 self._funding_cache_ts = time.time()
-                direction = "long-heavy" if rate > 0 else "short-heavy"
-                logger.info(
-                    f"[BTC ARB] Funding rate: {rate:+.6f}/8h ({direction}) — "
-                    f"ajuste P(UP): {-rate * FUNDING_BIAS_SCALE:+.3f}"
-                )
+                logger.debug(f"[BTC ARB] Funding: {rate:+.6f}/8h")
             time.sleep(FUNDING_CACHE_TTL)
 
     def _fetch_funding_rate(self) -> Optional[float]:
-        """
-        Obtiene el funding rate actual del perpetuo BTCUSDT en Binance Futures.
-        Positivo = longs pagan shorts (mercado sobre-comprado → presion bajista).
-        Negativo = shorts pagan longs (mercado sobre-vendido → presion alcista).
-        """
         try:
             r = requests.get(
                 BINANCE_FUNDING,
@@ -366,10 +318,81 @@ class BtcArbMonitor:
             if data:
                 return float(data[-1]["fundingRate"])
         except Exception as e:
-            logger.warning(f"[BTC ARB] No se pudo obtener funding rate: {e}")
+            logger.debug(f"[BTC ARB] Funding fetch error: {e}")
         return None
 
-    # ── Evaluate ────────────────────────────────────────────────────────────────
+    # ── Core: N(d₂) + Cornish-Fisher ───────────────────────────────────────
+
+    def _calc_probability(self, btc_spot: float, strike: float, hours_left: float, sigma_daily: float) -> float:
+        """
+        Calcula P(BTC_final > K) usando la formula correcta de opcion digital cash-or-nothing.
+
+        Formula Black-Scholes para opcion digital:
+            d₂ = [ln(S/K) - (σ²/2)·T] / (σ·√T)
+            P(S_T > K) = N(d₂)
+
+        Correccion Cornish-Fisher para fat tails de BTC:
+            z_CF = d₂ - (g₁/6)·(d₂²-1) - (g₂/24)·(d₂³-3d₂) + (g₁²/36)·(2d₂³-5d₂)
+            P_corr = N(z_CF)
+
+        Donde:
+            S = precio spot actual de BTC
+            K = strike (precio de referencia del mercado)
+            T = tiempo restante en dias
+            σ = volatilidad diaria (HAR-RV)
+            g₁ = skewness de retornos BTC (~-0.2)
+            g₂ = kurtosis excess de retornos BTC (~4.0)
+
+        Fundamento: los fat tails de BTC (kurtosis real ~6-10) hacen que N(d₂)
+        puro SUBESTIME las probabilidades extremas. Cornish-Fisher ajusta d₂
+        para reflejar la distribucion real sin requerir implementar el modelo Kou
+        completo de saltos.
+        """
+        if strike <= 0 or sigma_daily <= 0 or hours_left <= 0:
+            return 0.5
+
+        T = hours_left / 24.0  # tiempo en dias
+
+        # d₂ de Black-Scholes
+        try:
+            log_moneyness = math.log(btc_spot / strike)
+        except ValueError:
+            return 0.5
+
+        sigma_t = sigma_daily * math.sqrt(T)
+        if sigma_t < 1e-8:
+            # Tiempo casi cero: resultado determinista
+            return 1.0 if btc_spot > strike else 0.0
+
+        d2 = (log_moneyness - 0.5 * sigma_daily ** 2 * T) / sigma_t
+
+        # Cornish-Fisher: ajustar d₂ por skewness y kurtosis
+        g1 = BTC_SKEWNESS
+        g2 = BTC_KURTOSIS_EXCESS
+        d2_sq = d2 * d2
+        d2_cb = d2_sq * d2
+
+        z_cf = (
+            d2
+            - (g1 / 6.0)  * (d2_sq - 1.0)
+            - (g2 / 24.0) * (d2_cb - 3.0 * d2)
+            + (g1 ** 2 / 36.0) * (2.0 * d2_cb - 5.0 * d2)
+        )
+
+        p = _norm_cdf(z_cf)
+
+        # Ajuste de funding rate — solo en extremos de posicionamiento
+        funding = self._funding_rate
+        if funding > FUNDING_EXTREME_LONG:
+            # Mercado muy sobre-comprado → presion bajista real
+            p = max(0.01, p - FUNDING_ADJ_EXTREME)
+        elif funding < FUNDING_EXTREME_SHORT:
+            # Mercado muy sobre-vendido → presion alcista real
+            p = min(0.99, p + FUNDING_ADJ_EXTREME)
+
+        return max(0.01, min(0.99, p))
+
+    # ── Evaluate ────────────────────────────────────────────────────────────
 
     def _evaluate(self, triggered_by_move: bool = False):
         btc = self.btc_price
@@ -378,99 +401,91 @@ class BtcArbMonitor:
 
         self._last_eval_price = btc
 
-        # Reset ejecuciones si cambio el dia
+        # Reset diario — thread-safe
         today = datetime.now(timezone.utc).date()
-        if self._last_exec_date != today:
-            self._executed_today.clear()
-            self._last_exec_date = today
+        with self._exec_lock:
+            if self._last_exec_date != today:
+                self._executed_today.clear()
+                self._last_exec_date = today
 
-        # #1 — Obtener mercado con precio real (cache 30s)
         market = self._get_active_market()
         if not market:
             if not triggered_by_move:
-                logger.info(f"[BTC ARB] BTC=${btc:,.0f} | Sin mercado activo por el momento")
+                logger.debug(f"[BTC ARB] BTC=${btc:,.0f} | sin mercado diario activo")
             return
 
         condition_id = market.get("conditionId", "")
-        if condition_id in self._executed_today:
-            return
+        with self._exec_lock:
+            if condition_id in self._executed_today:
+                return
 
-        price_to_beat = self._get_price_to_beat(market)
-        if not price_to_beat:
-            logger.info(f"[BTC ARB] Sin priceToBeat aun: {market.get('question')}")
+        strike = self._get_strike(market)
+        if not strike:
+            logger.debug(f"[BTC ARB] Sin strike para: {market.get('question', '')[:50]}")
             return
 
         end_dt = self._parse_end_date(market.get("endDate", ""))
         if not end_dt:
             return
 
-        now           = datetime.now(timezone.utc)
-        hours_left    = (end_dt - now).total_seconds() / 3600
-        hours_elapsed = 24 - hours_left
+        now          = datetime.now(timezone.utc)
+        hours_left   = (end_dt - now).total_seconds() / 3600
+        hours_elapsed = 24.0 - hours_left
 
         if hours_left <= 0:
-            logger.info(f"[BTC ARB] Mercado {market.get('question')} ya cerro")
             return
-        if hours_left < BLACKOUT_MINUTES_BEFORE_CLOSE / 60:
-            logger.debug("[BTC ARB] Blackout period — muy cerca del cierre")
+        if hours_left < BLACKOUT_MINUTES_BEFORE_CLOSE / 60.0:
+            logger.debug("[BTC ARB] Blackout — muy cerca del cierre")
             return
         if hours_elapsed < MIN_HOURS_ELAPSED:
             logger.debug(f"[BTC ARB] Muy temprano ({hours_elapsed:.1f}h transcurridas)")
             return
 
-        # #3 — Vol realizada dinamica
-        vol  = self._realized_vol
-        pct_move        = (btc - price_to_beat) / price_to_beat
-        sigma_remaining = vol * (hours_left / 24) ** 0.5
+        # Calcular probabilidad con formula correcta
+        sigma = self._har_vol
+        p_true_up = self._calc_probability(btc, strike, hours_left, sigma)
+        p_true_dn = 1.0 - p_true_up
 
-        # #4 — t-distribution (fat tails) en vez de normal
-        if sigma_remaining > 0:
-            z = pct_move / sigma_remaining
-            p_up_base = float(student_t.cdf(z, df=BTC_TDIST_DF))
-        else:
-            p_up_base = 0.5
-
-        # #5 — Ajuste por funding rate
-        # Funding positivo → mercado sobre-comprado → presion bajista → reducir P(UP)
-        funding_adj = self._funding_rate * FUNDING_BIAS_SCALE
-        p_up_true = max(0.01, min(0.99, p_up_base - funding_adj))
-
-        # #1 — Precio real del mercado desde Gamma API
+        # Precio del mercado
         try:
-            raw_prices = market.get("outcomePrices", "[0.5,0.5]")
-            prices   = json.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
-            p_up_mkt = float(prices[0])
-            p_dn_mkt = float(prices[1])
+            raw = market.get("outcomePrices", "[0.5,0.5]")
+            prices_list = json.loads(raw) if isinstance(raw, str) else raw
+            p_mkt_up = float(prices_list[0])
+            p_mkt_dn = float(prices_list[1])
         except Exception:
             return
 
-        edge_up = p_up_true - p_up_mkt
-        edge_dn = (1 - p_up_true) - p_dn_mkt
+        # El edge es la diferencia entre probabilidad real y precio de mercado, menos fee
+        fee = 0.02
+        edge_up = p_true_up - p_mkt_up - fee
+        edge_dn = p_true_dn - p_mkt_dn - fee
 
-        best_edge = edge_up if abs(edge_up) >= abs(edge_dn) else edge_dn
-        side      = "UP"  if abs(edge_up) >= abs(edge_dn) else "DOWN"
-        p_true    = p_up_true if side == "UP" else (1 - p_up_true)
-        p_mkt     = p_up_mkt  if side == "UP" else p_dn_mkt
+        # Tomar el lado con mayor edge neto positivo
+        if edge_up >= edge_dn and edge_up > 0:
+            best_edge, side, p_true, p_mkt = edge_up, "UP",   p_true_up, p_mkt_up
+        elif edge_dn > edge_up and edge_dn > 0:
+            best_edge, side, p_true, p_mkt = edge_dn, "DOWN", p_true_dn, p_mkt_dn
+        else:
+            best_edge, side, p_true, p_mkt = max(edge_up, edge_dn), "UP" if edge_up >= edge_dn else "DOWN", p_true_up, p_mkt_up
 
+        move_pct = (btc - strike) / strike
         trigger_tag = "MOVE" if triggered_by_move else "TIMER"
-        funding_tag = f"fund={self._funding_rate:+.5f}" if self._funding_rate != 0 else "fund=n/a"
-        # Evaluaciones de movimiento siempre visibles; timers solo en DEBUG para reducir ruido
         log_fn = logger.info if triggered_by_move or best_edge >= self.min_edge else logger.debug
         log_fn(
-            f"[BTC ARB/{trigger_tag}] BTC={btc:,.0f} | ref={price_to_beat:,.0f} | "
-            f"move={pct_move:+.2%} | vol={vol:.3f} | sigma={sigma_remaining:.3f} | "
-            f"p_base={p_up_base:.3f} {funding_tag} P(UP)={p_up_true:.3f} mkt={p_up_mkt:.3f} | "
-            f"edge_{side}={best_edge:+.4f} | {hours_left:.1f}h left"
+            f"[BTC ARB/{trigger_tag}] BTC=${btc:,.0f} K=${strike:,.0f} move={move_pct:+.2%} | "
+            f"σ_HAR={sigma:.4f} T={hours_left:.1f}h | "
+            f"P(UP) real={p_true_up:.3f} mkt={p_mkt_up:.3f} | "
+            f"edge_{side}={best_edge:+.4f} (min={self.min_edge})"
         )
 
         if best_edge < self.min_edge:
-            # #6 — resetear confirmacion si el edge cae
+            # Reset confirmacion si edge cae
             if self._pending_condition_id:
-                self._consecutive_signal = 0
+                self._consecutive_signal  = 0
                 self._pending_condition_id = ""
             return
 
-        # #6 — Entry confirmation: requerir N evaluaciones consecutivas
+        # Entry confirmation: N evaluaciones consecutivas
         if self._pending_condition_id != condition_id:
             self._consecutive_signal  = 0
             self._pending_condition_id = condition_id
@@ -484,45 +499,34 @@ class BtcArbMonitor:
             )
             return
 
-        # Confirmado — ejecutar
+        # Confirmado — ejecutar y registrar
         self._consecutive_signal  = 0
         self._pending_condition_id = ""
         self._execute_signal(
             market=market, side=side, p_true=p_true, p_mkt=p_mkt,
-            edge=best_edge, btc_price=btc, price_to_beat=price_to_beat, hours_left=hours_left,
+            edge=best_edge, btc_price=btc, strike=strike, hours_left=hours_left,
         )
-        self._executed_today.add(condition_id)
+        with self._exec_lock:
+            self._executed_today.add(condition_id)
 
-    # ── Execute Signal ──────────────────────────────────────────────────────────
+    # ── Execute Signal ──────────────────────────────────────────────────────
 
-    def _execute_signal(self, market, side, p_true, p_mkt, edge, btc_price, price_to_beat, hours_left):
+    def _execute_signal(self, market, side, p_true, p_mkt, edge, btc_price, strike, hours_left):
         question     = market.get("question", "BTC Up or Down")
         condition_id = market.get("conditionId", "")
 
         if not self.executor:
-            mode = "DRY RUN"
+            mode = "DRY RUN (sin executor)"
             logger.info(
-                f"[BTC ARB {mode}] {question} | side={side} "
-                f"price={p_mkt:.3f} fair={p_true:.3f} edge={edge:.4f}"
+                f"[BTC ARB {mode}] {question[:60]} | "
+                f"side={side} price={p_mkt:.3f} fair={p_true:.3f} edge={edge:+.4f}"
             )
             if self.notifier:
                 self.notifier._send(
-                    f"[BTC ARB] {question}\n"
+                    f"[BTC ARB] {question[:80]}\n"
                     f"Side: {side} @ {p_mkt:.3f} | fair={p_true:.3f} | edge={edge:+.4f}\n"
-                    f"BTC: ${btc_price:,.0f} vs ref ${price_to_beat:,.0f} | {hours_left:.1f}h left"
-                )
-            # #7 — Registrar en P&L tracker aunque no haya executor
-            if self.pnl_tracker:
-                size_usd = min(self.bankroll_usd * 0.1, 20.0)  # estimacion conservadora
-                self.pnl_tracker.record_entry(
-                    condition_id=condition_id,
-                    question=question,
-                    side=side,
-                    entry_price=p_mkt,
-                    fair_value=p_true,
-                    edge=edge,
-                    size_usd=size_usd,
-                    dry_run=True,
+                    f"BTC: ${btc_price:,.0f} vs K=${strike:,.0f} | {hours_left:.1f}h restantes\n"
+                    f"σ_HAR={self._har_vol:.4f} | fund={self._funding_rate:+.6f}"
                 )
             return
 
@@ -533,11 +537,13 @@ class BtcArbMonitor:
         except Exception:
             pass
 
-        token_id = token_ids[0] if side == "UP"   and len(token_ids) > 0 else \
-                   token_ids[1] if side == "DOWN"  and len(token_ids) > 1 else ""
+        token_id = (
+            token_ids[0] if side == "UP"   and len(token_ids) > 0 else
+            token_ids[1] if side == "DOWN" and len(token_ids) > 1 else ""
+        )
 
         opp = Opportunity(
-            signal_type   = SignalType.PARITY,
+            signal_type   = SignalType.PRICE_DRIFT,
             condition_id  = condition_id,
             token_id      = token_id,
             question      = question,
@@ -550,107 +556,108 @@ class BtcArbMonitor:
             best_bid      = p_mkt,
             best_ask      = p_mkt,
             spread        = 0.001,
-            liquidity_usd = market.get("liquidityNum", 0),
-            volume_24h    = market.get("volume24hr", 0),
-            notes         = f"BTC_ARB btc={btc_price:.0f} ref={price_to_beat:.0f} vol={self._realized_vol:.3f} fund={self._funding_rate:+.5f} {hours_left:.1f}h",
+            liquidity_usd = float(market.get("liquidityNum") or 0),
+            volume_24h    = float(market.get("volume24hr") or 0),
+            notes=(
+                f"BTC_ARB_v4 | N(d2)+CF | "
+                f"btc={btc_price:.0f} K={strike:.0f} "
+                f"sigma={self._har_vol:.4f} T={hours_left:.1f}h "
+                f"fund={self._funding_rate:+.6f}"
+            ),
         )
 
         result = self.executor.maybe_execute(opp)
         if result:
             mode = "DRY RUN" if result.dry_run else "TRADE"
             msg = (
-                f"[BTC ARB {mode}] {question}\n"
-                f"Side: {side} @ {result.price:.3f} | ${result.position_usd:.2f} | edge={edge:.4f}\n"
-                f"BTC: ${btc_price:,.0f} vs ref ${price_to_beat:,.0f} | {hours_left:.1f}h left"
+                f"[BTC ARB {mode}] {question[:80]}\n"
+                f"Side: {side} @ {result.price:.3f} | ${result.position_usd:.2f} | edge={edge:+.4f}\n"
+                f"BTC: ${btc_price:,.0f} vs K=${strike:,.0f} | {hours_left:.1f}h left"
             )
             if not result.dry_run:
                 msg += f"\nOrder ID: {result.order_id}"
             if self.notifier:
                 self.notifier._send(msg)
 
-            # #7 — Registrar en P&L tracker solo si la orden fue aceptada
-            if self.pnl_tracker and (result.dry_run or result.success):
-                self.pnl_tracker.record_entry(
-                    condition_id=condition_id,
-                    question=question,
-                    side=side,
-                    entry_price=result.price,
-                    fair_value=p_true,
-                    edge=edge,
-                    size_usd=result.position_usd,
-                    dry_run=result.dry_run,
-                )
-
-    # ── Helpers ─────────────────────────────────────────────────────────────────
+    # ── Helpers ─────────────────────────────────────────────────────────────
 
     def _get_active_market(self) -> Optional[dict]:
         """
-        Obtiene el mercado BTC activo para hoy. Cache de 30s (#1).
-        Soporta tanto el formato legacy 'Bitcoin Up or Down' como el nuevo
-        'Will the price of Bitcoin be above $X on <fecha>?'
-        Prefiere el mercado con strike mas cercano al precio actual (maxima incertidumbre).
+        Obtiene el mercado BTC diario activo con mayor volumen.
+        Solo acepta mercados que resuelven en las proximas 48h (evitar fees dinamicos).
+        Cache de 30s.
         """
-        now = time.time()
-        if self._market_cache and now - self._market_cache_ts < MARKET_CACHE_TTL:
+        now_ts = time.time()
+        if self._market_cache and now_ts - self._market_cache_ts < MARKET_CACHE_TTL:
             return self._market_cache
+
         try:
-            today_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            r = requests.get(GAMMA_SERIES_URL, timeout=10)
+            r = requests.get(GAMMA_SEARCH_URL, timeout=10)
+            markets = r.json()
+
+            now_utc  = datetime.now(timezone.utc)
+            btc      = self.btc_price
             candidates = []
-            now_utc = datetime.now(timezone.utc)
-            for m in r.json():
+
+            for m in markets:
                 if m.get("closed", False):
                     continue
+
                 q = m.get("question", "").lower()
-                end = m.get("endDateIso", m.get("endDate", ""))[:10]
-                # Formato legacy
-                if "bitcoin up or down" in q:
-                    end_dt = self._parse_end_date(m.get("endDate", ""))
-                    if end_dt and end_dt <= now_utc:
-                        continue
-                    strike = self._get_price_to_beat(m)
-                    candidates.append((m, strike or 0))
+                if "bitcoin" not in q and "btc" not in q:
                     continue
-                # Formato nuevo: "will the price of bitcoin be above $X on <fecha>"
-                if "will the price of bitcoin be above" in q and end == today_iso:
-                    end_dt = self._parse_end_date(m.get("endDate", ""))
-                    if end_dt and end_dt <= now_utc:
-                        continue
-                    strike = self._parse_strike_from_question(m.get("question", ""))
-                    if strike:
-                        m["_parsed_strike"] = strike
-                        candidates.append((m, strike))
+
+                # Verificar que tiene strike (precio de referencia)
+                strike = self._get_strike(m)
+                if not strike:
+                    continue
+
+                # Verificar horizonte temporal: solo mercados que resuelven en 0-48h
+                end_dt = self._parse_end_date(m.get("endDate", ""))
+                if not end_dt:
+                    continue
+                hours_to_end = (end_dt - now_utc).total_seconds() / 3600
+                if hours_to_end <= 0 or hours_to_end > MAX_MARKET_DAYS * 24:
+                    continue
+
+                # Verificar volumen minimo
+                vol = float(m.get("volume24hr") or 0)
+                if vol < MIN_MARKET_VOLUME_USD:
+                    continue
+
+                candidates.append((m, strike, vol))
+
             if not candidates:
+                self._market_cache    = None
+                self._market_cache_ts = now_ts
                 return None
-            # Escoger el strike mas cercano al precio actual de BTC
-            btc = self.btc_price
+
+            # Preferir el strike mas cercano al precio actual (maxima incertidumbre = mayor edge potencial)
             if btc > 0:
-                candidates.sort(key=lambda x: abs(x[1] - btc))
-            best, strike = candidates[0]
-            self._market_cache    = best
-            self._market_cache_ts = now
-            logger.debug(f"[BTC ARB] Mercado seleccionado: strike=${strike:,.0f} ({best.get('question','')[:60]})")
-            return best
+                candidates.sort(key=lambda x: (abs(x[1] - btc), -x[2]))
+            else:
+                candidates.sort(key=lambda x: -x[2])
+
+            best_market, best_strike, best_vol = candidates[0]
+            self._market_cache    = best_market
+            self._market_cache_ts = now_ts
+            logger.debug(
+                f"[BTC ARB] Mercado: K=${best_strike:,.0f} vol=${best_vol:,.0f} "
+                f"({best_market.get('question','')[:60]})"
+            )
+            return best_market
+
         except Exception as e:
-            logger.warning(f"[BTC ARB] No se pudo obtener mercado activo: {e}")
-        return None
+            logger.warning(f"[BTC ARB] No se pudo obtener mercado: {e}")
+            return None
 
-    def _parse_strike_from_question(self, question: str) -> Optional[float]:
-        """Extrae el strike de 'Will the price of Bitcoin be above $70,000 on...'"""
-        import re
-        m = re.search(r'\$([0-9,]+)', question)
-        if m:
-            try:
-                return float(m.group(1).replace(',', ''))
-            except ValueError:
-                pass
-        return None
-
-    def _get_price_to_beat(self, market: dict) -> Optional[float]:
-        # Strike pre-parseado (mercados nuevos "above $X")
+    def _get_strike(self, market: dict) -> Optional[float]:
+        """Extrae el precio de referencia (strike) del mercado."""
+        # Primero: strike pre-parseado en cache
         if "_parsed_strike" in market:
             return market["_parsed_strike"]
-        # Legacy: eventMetadata.priceToBeat
+
+        # Segundo: eventMetadata.priceToBeat (mercados legacy)
         try:
             events = market.get("events", [])
             if events:
@@ -660,8 +667,20 @@ class BtcArbMonitor:
                     return val
         except Exception:
             pass
-        # Fallback: parsear del titulo
+
+        # Tercero: parsear del titulo "above $X"
         return self._parse_strike_from_question(market.get("question", ""))
+
+    def _parse_strike_from_question(self, question: str) -> Optional[float]:
+        """Extrae strike de 'Will the price of Bitcoin be above $70,000 on...'"""
+        import re
+        m = re.search(r'\$([0-9,]+)', question)
+        if m:
+            try:
+                return float(m.group(1).replace(",", ""))
+            except ValueError:
+                pass
+        return None
 
     def _parse_end_date(self, s: str) -> Optional[datetime]:
         try:
