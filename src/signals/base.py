@@ -51,6 +51,7 @@ class Opportunity:
     # Metadata
     detected_at: datetime = field(default_factory=datetime.utcnow)
     notes: str = ""
+    end_date: str = ""   # endDate del mercado (ISO) — para filtro de horizonte en executor
 
     def is_actionable(self, min_edge: float = 0.03) -> bool:
         return self.edge >= min_edge and self.market_price > 0

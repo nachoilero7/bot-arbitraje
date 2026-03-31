@@ -61,15 +61,17 @@ class TradeExecutor:
         max_position_usd: float = 20.0,    # maximo $20 por trade
         max_daily_loss_usd: float = 30.0,  # frena si perdemos mas de $30 en el dia
         kelly_fraction: float = 0.25,
+        max_days_to_resolution: int = 7,   # solo ejecutar en mercados que cierran dentro de N dias
         dry_run: bool = True,
         trades_csv: str = "data/trades.csv",
         proxy_address: str = None,         # Gnosis Safe (funder) — POLY_GNOSIS_SAFE mode
     ):
-        self.bankroll_usd      = bankroll_usd
-        self.min_edge_to_trade = min_edge_to_trade
-        self.max_position_usd  = max_position_usd
-        self.max_daily_loss_usd = max_daily_loss_usd
-        self.kelly_fraction    = kelly_fraction
+        self.bankroll_usd           = bankroll_usd
+        self.min_edge_to_trade      = min_edge_to_trade
+        self.max_position_usd       = max_position_usd
+        self.max_daily_loss_usd     = max_daily_loss_usd
+        self.kelly_fraction         = kelly_fraction
+        self.max_days_to_resolution = max_days_to_resolution
         self.dry_run           = dry_run
         self.trades_csv        = trades_csv
 
@@ -237,6 +239,25 @@ class TradeExecutor:
         # Edge minimo para ejecutar (mas alto que para detectar)
         if opp.edge < self.min_edge_to_trade:
             return False
+
+        # Horizonte temporal: solo mercados que resuelven pronto
+        if self.max_days_to_resolution > 0:
+            end_date = getattr(opp, "end_date", None)
+            if end_date:
+                try:
+                    from datetime import datetime, timezone
+                    dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    days_left = (dt - datetime.now(timezone.utc)).total_seconds() / 86400
+                    if days_left > self.max_days_to_resolution:
+                        logger.debug(
+                            f"[EXECUTOR] Skip {opp.condition_id[:12]} — "
+                            f"cierra en {days_left:.0f}d (max {self.max_days_to_resolution}d)"
+                        )
+                        return False
+                except Exception:
+                    pass
 
         # Token ID requerido para operar
         if not opp.token_id:

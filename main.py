@@ -84,7 +84,8 @@ def main():
     bankroll_usd        = float(os.getenv("BANKROLL_USD", "100"))
     max_position_usd    = float(os.getenv("MAX_POSITION_USD", "20"))
     max_daily_loss_usd  = float(os.getenv("MAX_DAILY_LOSS_USD", "10"))
-    min_edge_to_trade   = float(os.getenv("MIN_EDGE_TO_TRADE", "0.06"))
+    min_edge_to_trade       = float(os.getenv("MIN_EDGE_TO_TRADE", "0.06"))
+    max_days_to_resolution  = int(os.getenv("MAX_DAYS_TO_RESOLUTION", "7"))
 
     running = True
     def shutdown(sig, frame):
@@ -125,6 +126,7 @@ def main():
                     bankroll_usd=bankroll_usd,
                     max_position_usd=max_position_usd,
                     max_daily_loss_usd=max_daily_loss_usd,
+                    max_days_to_resolution=max_days_to_resolution,
                     dry_run=dry_run,
                     proxy_address=polygon_proxy_addr,
                 )
@@ -183,6 +185,7 @@ def main():
             max_position_usd=max_position_usd,
             max_daily_loss_usd=max_daily_loss_usd,
             min_edge_to_trade=min_edge_to_trade,
+            max_days_to_resolution=max_days_to_resolution,
             dry_run=dry_run,
             polygon_proxy_address=polygon_proxy_addr,
         )

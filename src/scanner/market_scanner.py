@@ -117,6 +117,7 @@ class MarketScanner:
         max_position_usd: float = 20.0,
         max_daily_loss_usd: float = 10.0,
         min_edge_to_trade: float = 0.06,
+        max_days_to_resolution: int = 7,
         dry_run: bool = True,
         polygon_proxy_address: str = None,  # Privy proxy wallet (POLY_PROXY mode)
     ):
@@ -226,6 +227,7 @@ class MarketScanner:
                 max_position_usd=max_position_usd,
                 max_daily_loss_usd=max_daily_loss_usd,
                 min_edge_to_trade=min_edge_to_trade,
+                max_days_to_resolution=max_days_to_resolution,
                 dry_run=dry_run,
                 proxy_address=polygon_proxy_address,
             )
@@ -365,6 +367,13 @@ class MarketScanner:
             )
             markets = self._filter_markets(markets)
             opportunities = self._run_signals(markets)
+
+            # Enriquecer oportunidades con end_date para filtro de horizonte en executor
+            market_by_cid = {m.get("conditionId", ""): m for m in markets}
+            for opp in opportunities:
+                m = market_by_cid.get(opp.condition_id, {})
+                opp.end_date = m.get("endDate", "") or m.get("endDateIso", "")
+
             self._print_opportunities(opportunities, scan_num, len(markets))
             self._save_opportunities(opportunities)
 
