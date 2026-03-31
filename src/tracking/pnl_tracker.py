@@ -204,46 +204,64 @@ class PnLTracker:
 
         console.print(table)
 
-        # Breakdown por señal
-        if len(by_signal) > 1:
-            sig_table = Table(title="Por señal (live)", box=box.SIMPLE, show_header=True)
-            sig_table.add_column("Señal",      style="dim")
-            sig_table.add_column("Invertido",  justify="right")
-            sig_table.add_column("P&L",        justify="right")
-            sig_table.add_column("W/L/O",      justify="right")
-            sig_table.add_column("Prox. cierre", justify="right", style="dim")
-            for sig, d in sorted(by_signal.items()):
-                pnl_c = f"[green]+${d['pnl']:.2f}[/green]" if d["pnl"] >= 0 else f"[red]-${abs(d['pnl']):.2f}[/red]"
-                cierre = self._format_next_close(d["end_dates"])
-                sig_table.add_row(sig, f"${d['invested']:.2f}", pnl_c, f"{d['won']}/{d['lost']}/{d['open']}", cierre)
-            console.print(sig_table)
+        # Tabla por trade individual
+        det = Table(title="Trades abiertos", box=box.SIMPLE, show_header=True)
+        det.add_column("Señal",    style="dim",          no_wrap=True, max_width=14)
+        det.add_column("Mercado",  style="white",        max_width=42)
+        det.add_column("Lado",     justify="center",     no_wrap=True)
+        det.add_column("Entrada",  justify="right",      no_wrap=True)
+        det.add_column("Actual",   justify="right",      no_wrap=True)
+        det.add_column("P&L",      justify="right",      no_wrap=True)
+        det.add_column("Estado",   justify="center",     no_wrap=True)
+        det.add_column("Cierre",   justify="right", style="dim", no_wrap=True)
 
-    def _format_next_close(self, end_dates: list[str]) -> str:
-        """Devuelve tiempo hasta el proximo cierre entre los trades abiertos del grupo."""
-        if not end_dates:
+        for t in sorted(trades, key=lambda x: self._state.get(x["condition_id"], {}).get("end_date", "9999")):
+            pnl, status = self._calc_pnl(t)
+            state       = self._state.get(t["condition_id"], {})
+            current     = state.get("current_price", t["price"])
+            end_date    = state.get("end_date", "")
+
+            pnl_str  = f"[green]+${pnl:.2f}[/green]" if pnl >= 0 else f"[red]-${abs(pnl):.2f}[/red]"
+            cierre   = self._format_close(end_date)
+
+            if status == "won":
+                estado = "[bold green]GANO[/bold green]"
+            elif status == "lost":
+                estado = "[bold red]PERDIO[/bold red]"
+            else:
+                estado = "[yellow]abierto[/yellow]"
+
+            det.add_row(
+                (t["signal_type"] or "?")[:14],
+                (t.get("question") or t["condition_id"][:20])[:42],
+                t["side"],
+                f"{t['price']:.3f}",
+                f"{current:.3f}",
+                pnl_str,
+                estado,
+                cierre,
+            )
+        console.print(det)
+
+    def _format_close(self, end_date: str) -> str:
+        """Formatea el tiempo hasta (o desde) la fecha de cierre de un trade."""
+        if not end_date:
             return "—"
-        now = datetime.now(timezone.utc)
-        soonest = None
-        for s in end_dates:
-            try:
-                dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                if soonest is None or dt < soonest:
-                    soonest = dt
-            except Exception:
-                continue
-        if soonest is None:
+        try:
+            dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        except Exception:
             return "—"
-        diff = soonest - now
+        diff       = dt - datetime.now(timezone.utc)
         total_secs = int(diff.total_seconds())
         if total_secs < 0:
             elapsed = abs(total_secs)
             if elapsed < 3600:
-                return f"vencio hace {elapsed // 60}m"
+                return f"+{elapsed // 60}m vencido"
             if elapsed < 86400:
-                return f"vencio hace {elapsed // 3600}h"
-            return f"vencio hace {elapsed // 86400}d"
+                return f"+{elapsed // 3600}h vencido"
+            return f"+{elapsed // 86400}d vencido"
         if total_secs < 3600:
             return f"{total_secs // 60}m"
         if total_secs < 86400:
@@ -310,6 +328,7 @@ class PnLTracker:
                         "signal_type":  row.get("signal_type", ""),
                         "condition_id": row.get("condition_id", ""),
                         "token_id":     row.get("token_id", ""),
+                        "question":     row.get("question", ""),
                         "side":         row.get("side", "YES"),
                         "price":        float(row.get("price", 0) or 0),
                         "size_tokens":  float(row.get("size_tokens", 0) or 0),
