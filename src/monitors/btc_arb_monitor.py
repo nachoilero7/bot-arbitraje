@@ -162,7 +162,7 @@ class BtcArbMonitor:
         threading.Thread(target=self._eval_loop,      daemon=True, name="btc-eval").start()
         threading.Thread(target=self._vol_updater,    daemon=True, name="btc-vol").start()
         threading.Thread(target=self._funding_updater, daemon=True, name="btc-fund").start()
-        logger.info("[BTC ARB v4] Monitor iniciado — N(d₂)+Cornish-Fisher+HAR-RV activo")
+        logger.info("[BTC ARB v4] Monitor iniciado - N(d2)+Cornish-Fisher+HAR-RV activo")
 
     def stop(self):
         self._running = False
@@ -226,7 +226,7 @@ class BtcArbMonitor:
             if vol > 0:
                 self._har_vol    = vol
                 self._vol_cache_ts = time.time()
-                logger.info(f"[BTC ARB] HAR-RV: σ={vol:.4f} ({vol*100:.2f}%/dia)")
+                logger.info(f"[BTC ARB] HAR-RV: sigma={vol:.4f} ({vol*100:.2f}%/dia)")
             time.sleep(VOL_CACHE_TTL)
 
     def _update_har_vol(self) -> float:
@@ -473,7 +473,7 @@ class BtcArbMonitor:
         log_fn = logger.info if triggered_by_move or best_edge >= self.min_edge else logger.debug
         log_fn(
             f"[BTC ARB/{trigger_tag}] BTC=${btc:,.0f} K=${strike:,.0f} move={move_pct:+.2%} | "
-            f"σ_HAR={sigma:.4f} T={hours_left:.1f}h | "
+            f"sigma_HAR={sigma:.4f} T={hours_left:.1f}h | "
             f"P(UP) real={p_true_up:.3f} mkt={p_mkt_up:.3f} | "
             f"edge_{side}={best_edge:+.4f} (min={self.min_edge})"
         )
@@ -526,7 +526,7 @@ class BtcArbMonitor:
                     f"[BTC ARB] {question[:80]}\n"
                     f"Side: {side} @ {p_mkt:.3f} | fair={p_true:.3f} | edge={edge:+.4f}\n"
                     f"BTC: ${btc_price:,.0f} vs K=${strike:,.0f} | {hours_left:.1f}h restantes\n"
-                    f"σ_HAR={self._har_vol:.4f} | fund={self._funding_rate:+.6f}"
+                    f"sigma_HAR={self._har_vol:.4f} | fund={self._funding_rate:+.6f}"
                 )
             return
 

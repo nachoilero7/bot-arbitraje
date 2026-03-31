@@ -322,6 +322,15 @@ class CombinatorialArbSignal(BaseSignal):
             except Exception:
                 continue
 
+            # Excluir preguntas donde NO hay exclusion mutua:
+            # "qualify", "advance", "reach" → multiples equipos pueden pasar
+            q_lower = question.lower()
+            if any(kw in q_lower for kw in (
+                "qualify", "advance", "reach the", "make the", "make it to",
+                "go to", "participate", "be relegated", "get relegated",
+            )):
+                continue
+
             # Clave de agrupacion: remover palabras en mayuscula (nombres propios)
             # y quedarse con la estructura de la pregunta
             base = re.sub(r'\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*\b', 'NAME', question)
