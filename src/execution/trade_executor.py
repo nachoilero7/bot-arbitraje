@@ -30,6 +30,25 @@ logger = get_logger(__name__)
 POLYGON_CHAIN_ID = 137
 CLOB_HOST        = "https://clob.polymarket.com"
 
+# Horizonte maximo de ejecucion por tipo de señal (en dias).
+# Basado en la investigacion de prediction market edges:
+#   - RESOLUTION_LAG:   el edge existe porque el resultado YA es conocido → operar solo si resuelve pronto
+#   - SPREAD_CAPTURE:   market making, queres capital rotando rapido
+#   - PRICE_DRIFT:      el momentum se diluye si el mercado tiene mucho tiempo por delante
+#   - OVERPRICED_NO:    similar a drift, condicion de mercado transitoria
+#   - CALIBRATION_BIAS: sesgo sistematico documentado en 124M trades, valido a cualquier horizonte
+#   - PARITY:           arbitraje puro, pero capital inmovilizado 30 dias es ineficiente
+#   - MISPRICED_CORR:   violaciones logicas pueden persistir, horizonte mas amplio OK
+SIGNAL_MAX_DAYS: dict[str, int] = {
+    "RESOLUTION_LAG":   3,   # resultado ya determinado, solo lag de precio
+    "SPREAD_CAPTURE":   3,   # market making, rotacion rapida de capital
+    "PRICE_DRIFT":      5,   # momentum se diluye con el tiempo
+    "OVERPRICED_NO":    5,   # condicion transitoria de mercado
+    "CALIBRATION_BIAS": 10,  # sesgo sistematico, valido a mediano plazo (SSRN 5910522)
+    "PARITY":           7,   # arb puro pero preferir mercados cercanos
+    "MISPRICED_CORR":   7,   # violaciones logicas / exclusion mutua
+}
+
 
 @dataclass
 class TradeResult:
@@ -240,24 +259,25 @@ class TradeExecutor:
         if opp.edge < self.min_edge_to_trade:
             return False
 
-        # Horizonte temporal: solo mercados que resuelven pronto
-        if self.max_days_to_resolution > 0:
-            end_date = getattr(opp, "end_date", None)
-            if end_date:
-                try:
-                    from datetime import datetime, timezone
-                    dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
-                    if dt.tzinfo is None:
-                        dt = dt.replace(tzinfo=timezone.utc)
-                    days_left = (dt - datetime.now(timezone.utc)).total_seconds() / 86400
-                    if days_left > self.max_days_to_resolution:
-                        logger.debug(
-                            f"[EXECUTOR] Skip {opp.condition_id[:12]} — "
-                            f"cierra en {days_left:.0f}d (max {self.max_days_to_resolution}d)"
-                        )
-                        return False
-                except Exception:
-                    pass
+        # Horizonte temporal por tipo de señal
+        end_date = getattr(opp, "end_date", "") or ""
+        if end_date:
+            try:
+                from datetime import timezone as _tz
+                dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=_tz.utc)
+                days_left = (dt - datetime.now(_tz.utc)).total_seconds() / 86400
+                signal_name = opp.signal_type.value if hasattr(opp.signal_type, "value") else str(opp.signal_type)
+                max_days = SIGNAL_MAX_DAYS.get(signal_name, self.max_days_to_resolution)
+                if days_left > max_days:
+                    logger.debug(
+                        f"[EXECUTOR] Skip {opp.condition_id[:12]} — "
+                        f"{signal_name} cierra en {days_left:.0f}d (max {max_days}d)"
+                    )
+                    return False
+            except Exception:
+                pass
 
         # Token ID requerido para operar
         if not opp.token_id:
