@@ -77,11 +77,23 @@ class PnLTracker:
     # ── Internal ───────────────────────────────────────────────────────────────
 
     def _fetch_batch(self, condition_ids: list[str]):
+        # Gamma API solo acepta condition_ids de a uno — requests individuales
+        markets = []
+        for cid in condition_ids:
+            try:
+                resp = requests.get(
+                    f"{GAMMA_API}/markets",
+                    params={"condition_ids": cid},
+                    proxies=self._proxies,
+                    timeout=10,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                if data:
+                    markets.extend(data)
+            except Exception as e:
+                logger.debug(f"[PNL] Error fetching {cid[:12]}: {e}")
         try:
-            url = f"{GAMMA_API}/markets?condition_ids={','.join(condition_ids)}"
-            resp = requests.get(url, proxies=self._proxies, timeout=10)
-            resp.raise_for_status()
-            markets = resp.json()
             for m in markets:
                 cid = m.get("conditionId") or m.get("condition_id", "")
                 if not cid:
