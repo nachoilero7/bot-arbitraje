@@ -14,7 +14,7 @@ import csv
 import json
 import os
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 
 import requests
 from rich.console import Console
@@ -87,6 +87,7 @@ class PnLTracker:
                 if not cid:
                     continue
                 resolved = m.get("resolved", False) or m.get("isResolved", False)
+                end_date = m.get("endDate") or m.get("endDateIso") or ""
                 if resolved:
                     prices = m.get("outcomePrices", [])
                     try:
@@ -96,6 +97,7 @@ class PnLTracker:
                     self._state[cid] = {
                         "status": "won" if yes_exit >= 0.99 else "lost",
                         "exit_price": yes_exit,
+                        "end_date": end_date,
                     }
                 else:
                     # Mark-to-market: usar el mejor precio disponible
@@ -108,6 +110,7 @@ class PnLTracker:
                         "status": "open",
                         "current_price": current,
                         "exit_price": entry.get("exit_price"),
+                        "end_date": end_date or entry.get("end_date", ""),
                     }
         except Exception as e:
             logger.debug(f"[PNL] Error fetching batch: {e}")
@@ -148,7 +151,7 @@ class PnLTracker:
     def _print_live_summary(self, trades: list[dict]):
         total_invested = sum(t["position_usd"] for t in trades)
         total_pnl = 0.0
-        by_signal: dict = defaultdict(lambda: {"invested": 0, "pnl": 0, "won": 0, "lost": 0, "open": 0})
+        by_signal: dict = defaultdict(lambda: {"invested": 0, "pnl": 0, "won": 0, "lost": 0, "open": 0, "end_dates": []})
         wins = losses = open_count = 0
 
         for t in trades:
@@ -158,6 +161,10 @@ class PnLTracker:
             by_signal[sig]["invested"] += t["position_usd"]
             by_signal[sig]["pnl"]      += pnl
             by_signal[sig][status]     += 1
+            if status == "open":
+                end_date = self._state.get(t["condition_id"], {}).get("end_date", "")
+                if end_date:
+                    by_signal[sig]["end_dates"].append(end_date)
             if status == "won":
                 wins += 1
             elif status == "lost":
@@ -188,14 +195,47 @@ class PnLTracker:
         # Breakdown por señal
         if len(by_signal) > 1:
             sig_table = Table(title="Por señal (live)", box=box.SIMPLE, show_header=True)
-            sig_table.add_column("Señal",     style="dim")
-            sig_table.add_column("Invertido", justify="right")
-            sig_table.add_column("P&L",       justify="right")
-            sig_table.add_column("W/L/O",     justify="right")
+            sig_table.add_column("Señal",      style="dim")
+            sig_table.add_column("Invertido",  justify="right")
+            sig_table.add_column("P&L",        justify="right")
+            sig_table.add_column("W/L/O",      justify="right")
+            sig_table.add_column("Prox. cierre", justify="right", style="dim")
             for sig, d in sorted(by_signal.items()):
                 pnl_c = f"[green]+${d['pnl']:.2f}[/green]" if d["pnl"] >= 0 else f"[red]-${abs(d['pnl']):.2f}[/red]"
-                sig_table.add_row(sig, f"${d['invested']:.2f}", pnl_c, f"{d['won']}/{d['lost']}/{d['open']}")
+                cierre = self._format_next_close(d["end_dates"])
+                sig_table.add_row(sig, f"${d['invested']:.2f}", pnl_c, f"{d['won']}/{d['lost']}/{d['open']}", cierre)
             console.print(sig_table)
+
+    def _format_next_close(self, end_dates: list[str]) -> str:
+        """Devuelve tiempo hasta el proximo cierre entre los trades abiertos del grupo."""
+        if not end_dates:
+            return "—"
+        now = datetime.now(timezone.utc)
+        soonest = None
+        for s in end_dates:
+            try:
+                dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                if soonest is None or dt < soonest:
+                    soonest = dt
+            except Exception:
+                continue
+        if soonest is None:
+            return "—"
+        diff = soonest - now
+        total_secs = int(diff.total_seconds())
+        if total_secs < 0:
+            return "vencido"
+        if total_secs < 3600:
+            return f"{total_secs // 60}m"
+        if total_secs < 86400:
+            h = total_secs // 3600
+            m = (total_secs % 3600) // 60
+            return f"{h}h {m}m"
+        d = total_secs // 86400
+        h = (total_secs % 86400) // 3600
+        return f"{d}d {h}h"
 
     def _print_dry_summary(self, trades: list[dict]):
         """Para dry_run: muestra P&L hipotético basado en el edge declarado."""
