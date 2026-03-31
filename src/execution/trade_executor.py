@@ -183,6 +183,19 @@ class TradeExecutor:
         else:
             size_tokens = round(size_usd / price, 2) if price > 0 else 0
 
+        # Polymarket CLOB requiere minimo 5 tokens por orden
+        MIN_TOKENS = 5.0
+        if size_tokens < MIN_TOKENS:
+            min_usd = MIN_TOKENS * price
+            if min_usd > self.max_position_usd:
+                logger.debug(
+                    f"[EXECUTOR] Skip {opportunity.condition_id[:12]} — "
+                    f"min order ${min_usd:.2f} > max_position ${self.max_position_usd:.2f}"
+                )
+                return None
+            size_tokens = MIN_TOKENS
+            size_usd    = round(MIN_TOKENS * price, 2)
+
         if self.dry_run:
             result = self._simulate_trade(opportunity, price, size_tokens, size_usd)
         else:
