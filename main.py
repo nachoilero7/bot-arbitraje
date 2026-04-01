@@ -11,7 +11,6 @@ Modos:
 import argparse
 import time
 import signal
-import sys
 import os
 
 import yaml
