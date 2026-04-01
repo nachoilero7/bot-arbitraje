@@ -542,13 +542,17 @@ class BtcArbMonitor:
             token_ids[1] if side == "DOWN" and len(token_ids) > 1 else ""
         )
 
+        # UP compra el token YES (index 0), DOWN compra el token NO (index 1).
+        # El P&L tracker solo entiende YES/NO para calcular correctamente el resultado.
+        clob_side = "YES" if side == "UP" else "NO"
+
         opp = Opportunity(
             signal_type   = SignalType.PRICE_DRIFT,
             condition_id  = condition_id,
             token_id      = token_id,
             question      = question,
             category      = "Crypto",
-            side          = side,
+            side          = clob_side,
             market_price  = p_mkt,
             fair_value    = p_true,
             edge          = edge,
