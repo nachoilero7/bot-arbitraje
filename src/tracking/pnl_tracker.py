@@ -13,6 +13,7 @@ Estado de cada trade:
 import csv
 import json
 import os
+from json import JSONDecodeError
 from collections import defaultdict
 from datetime import datetime, timezone
 
@@ -103,7 +104,12 @@ class PnLTracker:
                 # Polymarket marca resolucion con closed=True + outcomePrices extremas
                 # (resolved=None siempre, no usar)
                 closed = m.get("closed", False)
-                prices = m.get("outcomePrices", [])
+                prices_raw = m.get("outcomePrices", [])
+                # outcomePrices puede venir como string JSON o como lista
+                try:
+                    prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
+                except (JSONDecodeError, TypeError):
+                    prices = []
                 try:
                     yes_price = float(prices[0]) if prices else None
                 except (IndexError, TypeError, ValueError):
@@ -141,37 +147,48 @@ class PnLTracker:
             logger.debug(f"[PNL] Error fetching batch: {e}")
 
     def _calc_pnl(self, trade: dict) -> tuple[float, str]:
-        """Retorna (pnl_usd, status) para un trade."""
+        """
+        Retorna (pnl_usd, position_status) donde position_status refleja si
+        la POSICION (no el token YES) ganó o perdió.
+
+        El estado guardado en _state es YES-centrico:
+          "won"  → YES resolvio a 1.0
+          "lost" → YES resolvio a 0.0
+        Para posiciones NO, esto se invierte al mostrar.
+        """
         cid    = trade["condition_id"]
         side   = trade["side"]
         price  = trade["price"]
         size   = trade["size_tokens"]
-        cost   = trade["position_usd"]
         state  = self._state.get(cid, {})
-        status = state.get("status", "open")
+        market_status = state.get("status", "open")  # YES-centrico
 
-        if status in ("won", "lost"):
-            exit_p = state.get("exit_price", 1.0 if status == "won" else 0.0)
+        if market_status in ("won", "lost"):
+            exit_p = state.get("exit_price", 1.0 if market_status == "won" else 0.0)
             if side == "YES":
                 pnl = (exit_p - price) * size
+                position_status = market_status
             elif side == "NO":
-                # NO tokens: ganas si YES resuelve a 0
                 pnl = ((1.0 - exit_p) - price) * size
+                # Para NO: "won" en YES significa NO perdio, y viceversa
+                position_status = "lost" if market_status == "won" else "won"
             else:  # YES+NO parity
-                # price = p_yes + p_no (costo total por par), exit siempre = 1.0
                 pnl = (1.0 - price) * size
-        elif status == "open":
+                position_status = market_status
+        elif market_status == "open":
             current = state.get("current_price", price)
             if side == "YES":
                 pnl = (current - price) * size
             elif side == "NO":
                 pnl = ((1.0 - current) - price) * size
             else:
-                pnl = (1.0 - price) * size * 0  # parity: P&L realizado en resolución
+                pnl = 0.0
+            position_status = "open"
         else:
             pnl = 0.0
+            position_status = "open"
 
-        return pnl, status
+        return pnl, position_status
 
     def _print_live_summary(self, trades: list[dict]):
         total_invested = sum(t["position_usd"] for t in trades)
@@ -231,8 +248,14 @@ class PnLTracker:
         for t in sorted(trades, key=lambda x: self._state.get(x["condition_id"], {}).get("end_date", "9999")):
             pnl, status = self._calc_pnl(t)
             state       = self._state.get(t["condition_id"], {})
-            current     = state.get("current_price", t["price"])
             end_date    = state.get("end_date", "")
+            # Para trades resueltos mostrar el precio de salida; para abiertos el precio actual
+            if status in ("won", "lost"):
+                exit_p  = state.get("exit_price", 0.0)
+                # Mostrar el precio efectivo del lado de la posicion
+                current = (1.0 - exit_p) if t["side"] == "NO" else exit_p
+            else:
+                current = state.get("current_price", t["price"])
 
             pnl_str  = f"[green]+${pnl:.2f}[/green]" if pnl >= 0 else f"[red]-${abs(pnl):.2f}[/red]"
             cierre   = self._format_close(end_date)
