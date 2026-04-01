@@ -125,6 +125,11 @@ class ManifoldClient:
             for result in results:
                 if result.get("isResolved", True):
                     continue  # solo mercados activos
+                if result.get("outcomeType") != "BINARY":
+                    continue  # solo binarios tienen campo probability
+                prob_raw = result.get("probability")
+                if prob_raw is None:
+                    continue
                 result_words = _extract_words(result.get("question", ""))
                 sim = _jaccard(question_words, result_words)
                 if sim > best_similarity:
@@ -133,7 +138,7 @@ class ManifoldClient:
 
             probability: float | None = None
             if best_result is not None and best_similarity >= JACCARD_THRESHOLD:
-                probability = float(best_result["probability"])
+                probability = float(best_result.get("probability"))
                 logger.debug(
                     f"Manifold match (sim={best_similarity:.2f}): "
                     f"'{best_result.get('question', '')[:60]}' → {probability:.3f}"
