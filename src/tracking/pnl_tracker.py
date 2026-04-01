@@ -167,6 +167,12 @@ class PnLTracker:
         state  = self._state.get(cid, {})
         market_status = state.get("status", "open")  # YES-centrico
 
+        # BTC monitor legacy: UP/DOWN → YES/NO para el calculo
+        if side == "UP":
+            side = "YES"
+        elif side == "DOWN":
+            side = "NO"
+
         if market_status in ("won", "lost"):
             exit_p = state.get("exit_price", 1.0 if market_status == "won" else 0.0)
             if side == "YES":
