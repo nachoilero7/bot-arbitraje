@@ -110,6 +110,7 @@ class MarketScanner:
         odds_api_key: str = None,
         rapidapi_key: str = None,
         finnhub_api_key: str = None,
+        metaculus_api_token: str = None,
         telegram_token: str = None,
         telegram_chat_id: str = None,
         telegram_min_edge: float = 0.05,
@@ -221,6 +222,18 @@ class MarketScanner:
                 min_edge=min_edge,
             ))
             logger.info("ManifoldDivergenceSignal enabled (cross-platform, free)")
+
+        # Metaculus superforecasters (requiere token — METACULUS_API_TOKEN en .env)
+        if metaculus_api_token and _MANIFOLD_AVAILABLE:
+            from src.enrichers.metaculus import MetaculusClient
+            metaculus_client = MetaculusClient(api_token=metaculus_api_token, proxy=proxy)
+            self.signals.append(MetaculusDivergenceSignal(
+                enricher=metaculus_client,
+                source_name="METACULUS",
+                fee_rate=fee_rate,
+                min_edge=min_edge,
+            ))
+            logger.info("MetaculusDivergenceSignal enabled (superforecasters)")
 
         # Telegram notifier
         if telegram_token and telegram_chat_id and _TELEGRAM_AVAILABLE:

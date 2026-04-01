@@ -71,7 +71,8 @@ def main():
     proxy               = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or None
     odds_api_key        = os.getenv("ODDS_API_KEY") or None
     rapidapi_key        = os.getenv("RAPIDAPI_KEY") or None
-    finnhub_api_key     = os.getenv("FINNHUB_API_KEY") or None
+    finnhub_api_key       = os.getenv("FINNHUB_API_KEY") or None
+    metaculus_api_token   = os.getenv("METACULUS_API_TOKEN") or None
     telegram_token      = os.getenv("TELEGRAM_BOT_TOKEN") or None
     telegram_chat_id    = os.getenv("TELEGRAM_CHAT_ID") or None
     clob_private_key    = os.getenv("POLYGON_PRIVATE_KEY") or None
@@ -172,6 +173,7 @@ def main():
             odds_api_key=odds_api_key,
             rapidapi_key=rapidapi_key,
             finnhub_api_key=finnhub_api_key,
+            metaculus_api_token=metaculus_api_token,
             telegram_token=telegram_token,
             telegram_chat_id=telegram_chat_id,
             telegram_min_edge=float(os.getenv("TELEGRAM_MIN_EDGE", "0.05")),

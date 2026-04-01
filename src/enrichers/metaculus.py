@@ -1,14 +1,13 @@
 """
 Enricher: Metaculus API
-https://www.metaculus.com/api2 — free API, no auth required
+https://www.metaculus.com/api2 — requiere token desde 2024 (cuenta gratuita)
 
-Obtiene probabilidades de superforecasters de Metaculus para preguntas
-de prediccion y las compara contra precios de Polymarket.
+Para obtener el token:
+  1. Registrarse en https://www.metaculus.com (gratis)
+  2. Settings -> API -> copiar el token
+  3. Agregar al .env: METACULUS_API_TOKEN=tu_token
 
-Uso:
-  client = MetaculusClient()
-  prob = client.find_probability("Will X happen by end of 2025?")
-  # Returns float (e.g. 0.73) or None if no good match
+Sin token: el cliente retorna None en todas las consultas (no rompe nada).
 """
 import re
 import time
@@ -53,9 +52,12 @@ def _jaccard(set_a: set[str], set_b: set[str]) -> float:
 
 class MetaculusClient:
 
-    def __init__(self, proxy: str = None, timeout: int = 10):
-        self.timeout = timeout
-        self.session = requests.Session()
+    def __init__(self, api_token: str = None, proxy: str = None, timeout: int = 10):
+        self.timeout   = timeout
+        self._has_auth = bool(api_token)
+        self.session   = requests.Session()
+        if api_token:
+            self.session.headers["Authorization"] = f"Token {api_token}"
         if proxy:
             self.session.proxies = {"http": proxy, "https": proxy}
         # Cache: { question[:80]: (probability, timestamp) }
@@ -106,6 +108,10 @@ class MetaculusClient:
             prob, ts = self._cache[cache_key]
             if time.time() - ts < CACHE_TTL_SECS:
                 return prob
+
+        # Sin token no podemos consultar la API (requiere auth desde 2024)
+        if not self._has_auth:
+            return None
 
         # Build search query from top 5 content words
         words = _content_words(question)
