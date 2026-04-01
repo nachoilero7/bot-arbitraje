@@ -16,8 +16,8 @@ from src.utils.logger import get_logger
 logger = get_logger(__name__)
 
 BASE_URL = "https://manifold.markets/api/v0"
-CACHE_TTL_SECS = 7200   # 2 hours
-RATE_LIMIT_SECS = 1.0   # 1 req/sec
+CACHE_TTL_SECS  = 7200  # 2 hours
+RATE_LIMIT_SECS = 0.2   # 5 req/sec — Manifold API es permisiva
 
 _STOP_WORDS = {
     "will", "the", "be", "a", "an", "in", "on", "at", "to", "for", "of",

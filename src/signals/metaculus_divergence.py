@@ -24,11 +24,12 @@ from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-MIN_DIVERGENCE = 0.08   # 8pp threshold (Dillon et al. 2023)
-MIN_VOLUME_24H = 500
-MIN_LIQUIDITY  = 1000
-PRICE_FLOOR    = 0.05   # Skip extreme prices — cobertura externa pobre
-PRICE_CEIL     = 0.95
+MIN_DIVERGENCE     = 0.08   # 8pp threshold (Dillon et al. 2023)
+MIN_VOLUME_24H     = 500
+MIN_LIQUIDITY      = 1000
+PRICE_FLOOR        = 0.05   # Skip extreme prices — cobertura externa pobre
+PRICE_CEIL         = 0.95
+MAX_QUERIES_PER_SCAN = 40   # Cap de consultas por scan — evita bloquear el loop
 
 
 class MetaculusDivergenceSignal(BaseSignal):
@@ -46,7 +47,16 @@ class MetaculusDivergenceSignal(BaseSignal):
     def detect(self, markets: list[dict], prices: dict = None) -> list[Opportunity]:
         opportunities = []
 
-        for market in markets:
+        # Priorizar los mercados con mayor volumen; cap de API calls por scan
+        # (mercados ya cacheados no cuentan contra el cap)
+        sorted_markets = sorted(
+            markets,
+            key=lambda m: float(m.get("volume24hr") or 0),
+            reverse=True,
+        )
+        api_calls_remaining = MAX_QUERIES_PER_SCAN
+
+        for market in sorted_markets:
             try:
                 # Liquidity and volume filters
                 volume_24h  = float(market.get("volume24hr") or 0)
@@ -76,6 +86,15 @@ class MetaculusDivergenceSignal(BaseSignal):
                     continue
 
                 # Query enricher externo (Manifold, Metaculus, etc)
+                # Si el enricher tiene cache interno, la consulta es instantanea.
+                # Si no esta en cache, consume un slot del cap por scan.
+                cache_key = question.strip().lower()
+                in_cache  = cache_key in getattr(self.enricher, "_cache", {})
+                if not in_cache:
+                    if api_calls_remaining <= 0:
+                        continue  # cap alcanzado, dejar para el proximo scan
+                    api_calls_remaining -= 1
+
                 ext_prob = self.enricher.find_probability(question)
                 if ext_prob is None:
                     continue
