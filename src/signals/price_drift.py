@@ -17,12 +17,15 @@ from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-MIN_HISTORY_POINTS    = 4     # Minimo de puntos para calcular drift
-MIN_DRIFT_MAGNITUDE   = 0.04  # Cambio minimo en YES para señalar drift
-RECOVERY_FACTOR       = 0.5   # Recuperacion esperada como fraccion del drift
-MAX_HISTORY_PER_MARKET = 20   # Maximo de entradas guardadas por mercado
-MIN_LIQUIDITY         = 500   # USD minimo de liquidez
-MIN_VOLUME_24H        = 100   # USD minimo de volumen diario
+MIN_HISTORY_POINTS     = 4      # Minimo de puntos para calcular drift
+MIN_DRIFT_MAGNITUDE    = 0.05   # Cambio minimo en YES (subido de 0.04 para reducir ruido)
+RECOVERY_FACTOR        = 0.5    # Recuperacion esperada como fraccion del drift
+MAX_HISTORY_PER_MARKET = 20     # Maximo de entradas guardadas por mercado
+MIN_LIQUIDITY          = 2000   # USD minimo de liquidez (subido de 500)
+MIN_VOLUME_24H         = 1000   # USD minimo de volumen diario (subido de 100)
+MIN_HISTORY_SPAN_SECS  = 300    # Los 4 puntos deben cubrir al menos 5 minutos
+PRICE_FLOOR            = 0.07   # Ignorar mercados con YES < 7% (probablemente resolviendo)
+PRICE_CEIL             = 0.93   # Ignorar mercados con YES > 93% (probablemente resolviendo)
 
 
 class PriceDriftSignal(BaseSignal):
@@ -65,6 +68,11 @@ class PriceDriftSignal(BaseSignal):
                 if yes_price <= 0:
                     continue
 
+                # Ignorar mercados cerca de resolución — su movimiento de precio
+                # refleja el resultado, no un desequilibrio de order flow
+                if yes_price < PRICE_FLOOR or yes_price > PRICE_CEIL:
+                    continue
+
                 # ── Actualizar historial ──────────────────────────────────
                 if cond_id not in self._history:
                     self._history[cond_id] = []
@@ -77,6 +85,12 @@ class PriceDriftSignal(BaseSignal):
 
                 history = self._history[cond_id]
                 if len(history) < MIN_HISTORY_POINTS:
+                    continue
+
+                # Los puntos deben cubrir al menos 5 minutos — evita actuar sobre
+                # ruido de 20 segundos (4 scans * 5s = solo ruido de spread)
+                oldest_ts, newest_ts = history[-MIN_HISTORY_POINTS][0], history[-1][0]
+                if newest_ts - oldest_ts < MIN_HISTORY_SPAN_SECS:
                     continue
 
                 # ── Filtros de liquidez ───────────────────────────────────
