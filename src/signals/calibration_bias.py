@@ -41,6 +41,27 @@ MIN_LIQUIDITY = 1_000   # USD — necesitamos poder ejecutar
 MIN_VOLUME_24H = 200    # USD — mercado activo
 MAX_SPREAD = 0.20       # no entrar en mercados con spread demasiado amplio
 
+# Per-category calibration adjustments based on empirical research:
+# Leigh & Wolfers (2006) - political markets; Barber et al. (2022) - retail attention
+# Values: (yes_adjustment, no_adjustment) — positive = market underprices, buy that side
+_CATEGORY_ADJUSTMENTS: dict[str, tuple[float, float]] = {
+    # Politics: incumbents & frontrunners overvalued; underdogs undervalued
+    "politics":     (-0.03, +0.03),   # fade YES on favorites
+    "election":     (-0.03, +0.03),
+    "government":   (-0.02, +0.02),
+    # Sports: home team & favorite overvalued in high-profile events
+    "sports":       (-0.02, +0.02),
+    "soccer":       (-0.02, +0.02),
+    "basketball":   (-0.02, +0.02),
+    "football":     (-0.02, +0.02),
+    # Crypto: extreme outcomes have higher calibration error (tail risk underestimated)
+    "crypto":       (+0.01, -0.01),   # slight YES boost (black swans more likely)
+    "bitcoin":      (+0.01, -0.01),
+    # Economics: near-term well calibrated, no strong adjustment
+    "economics":    (0.0, 0.0),
+    # Default (no category match): no adjustment
+}
+
 
 class CalibrationBiasSignal(BaseSignal):
     """
@@ -98,13 +119,16 @@ class CalibrationBiasSignal(BaseSignal):
                 best_bid = float(market.get("bestBid") or 0)
                 best_ask = float(market.get("bestAsk") or 0)
 
+                yes_adj, no_adj = self._get_category_adjustment(market)
+
                 # ── Caso LOW: YES < 10% → mercado subestima, comprar YES ──
                 if yes_price < LOW_PROB_THRESHOLD:
-                    true_yes  = min(yes_price * LOW_PROB_ADJUSTMENT, LOW_PROB_THRESHOLD * 1.5)
-                    edge      = true_yes - yes_price - self.fee_rate
+                    true_yes      = min(yes_price * LOW_PROB_ADJUSTMENT, LOW_PROB_THRESHOLD * 1.5)
+                    edge          = true_yes - yes_price - self.fee_rate
+                    adjusted_edge = edge + yes_adj
 
-                    if edge >= self.min_edge:
-                        edge_pct = edge / yes_price if yes_price > 0 else 0
+                    if adjusted_edge >= self.min_edge:
+                        edge_pct = adjusted_edge / yes_price if yes_price > 0 else 0
                         opp = Opportunity(
                             signal_type=SignalType.CALIBRATION_BIAS,
                             condition_id=cond_id,
@@ -114,7 +138,7 @@ class CalibrationBiasSignal(BaseSignal):
                             side="YES",
                             market_price=yes_price,
                             fair_value=round(true_yes, 5),
-                            edge=round(edge, 5),
+                            edge=round(adjusted_edge, 5),
                             edge_pct=round(edge_pct, 4),
                             best_bid=best_bid,
                             best_ask=best_ask,
@@ -125,23 +149,25 @@ class CalibrationBiasSignal(BaseSignal):
                                 f"calib_low | YES={yes_price:.3f} "
                                 f"true_est={true_yes:.3f} "
                                 f"adj={LOW_PROB_ADJUSTMENT:.2f}x | "
-                                f"edge={edge:.4f} | SSRN5910522"
+                                f"edge={adjusted_edge:.4f} | SSRN5910522"
+                                f" | cat_adj={yes_adj:+.2f}"
                             ),
                         )
                         opportunities.append(opp)
                         logger.info(
                             f"[CALIBRATION_BIAS] LOW {question[:50]} | "
-                            f"yes={yes_price:.3f} est={true_yes:.3f} edge={edge:.4f}"
+                            f"yes={yes_price:.3f} est={true_yes:.3f} edge={adjusted_edge:.4f}"
                         )
 
                 # ── Caso HIGH: YES > 80% → mercado sobrevalua, comprar NO ─
                 elif yes_price > HIGH_PROB_THRESHOLD:
-                    true_yes  = yes_price * HIGH_PROB_ADJUSTMENT
-                    true_no   = 1.0 - true_yes
-                    edge      = true_no - no_price - self.fee_rate
+                    true_yes      = yes_price * HIGH_PROB_ADJUSTMENT
+                    true_no       = 1.0 - true_yes
+                    edge          = true_no - no_price - self.fee_rate
+                    adjusted_edge = edge + no_adj
 
-                    if edge >= self.min_edge:
-                        edge_pct = edge / no_price if no_price > 0 else 0
+                    if adjusted_edge >= self.min_edge:
+                        edge_pct = adjusted_edge / no_price if no_price > 0 else 0
                         no_token = token_ids[1] if len(token_ids) > 1 else ""
                         opp = Opportunity(
                             signal_type=SignalType.CALIBRATION_BIAS,
@@ -152,7 +178,7 @@ class CalibrationBiasSignal(BaseSignal):
                             side="NO",
                             market_price=no_price,
                             fair_value=round(true_no, 5),
-                            edge=round(edge, 5),
+                            edge=round(adjusted_edge, 5),
                             edge_pct=round(edge_pct, 4),
                             best_bid=best_bid,
                             best_ask=best_ask,
@@ -163,13 +189,14 @@ class CalibrationBiasSignal(BaseSignal):
                                 f"calib_high | YES={yes_price:.3f} "
                                 f"true_yes={true_yes:.3f} fair_NO={true_no:.3f} "
                                 f"market_NO={no_price:.3f} | "
-                                f"edge={edge:.4f} | SSRN5910522"
+                                f"edge={adjusted_edge:.4f} | SSRN5910522"
+                                f" | cat_adj={no_adj:+.2f}"
                             ),
                         )
                         opportunities.append(opp)
                         logger.info(
                             f"[CALIBRATION_BIAS] HIGH {question[:50]} | "
-                            f"yes={yes_price:.3f} true_no={true_no:.3f} edge={edge:.4f}"
+                            f"yes={yes_price:.3f} true_no={true_no:.3f} edge={adjusted_edge:.4f}"
                         )
 
             except Exception as e:
@@ -183,3 +210,32 @@ class CalibrationBiasSignal(BaseSignal):
         if events and isinstance(events, list) and events:
             return events[0].get("category", "") or events[0].get("title", "")
         return ""
+
+    def _get_category_adjustment(self, market: dict) -> tuple[float, float]:
+        """
+        Return (yes_adjustment, no_adjustment) for the market's category.
+
+        Checks category text from multiple fields, lowercased substring match
+        against _CATEGORY_ADJUSTMENTS keys.
+        """
+        candidates: list[str] = []
+
+        events = market.get("events")
+        if events and isinstance(events, list) and events:
+            event = events[0]
+            if event.get("category"):
+                candidates.append(str(event["category"]).lower())
+            if event.get("title"):
+                candidates.append(str(event["title"]).lower())
+
+        if market.get("category"):
+            candidates.append(str(market["category"]).lower())
+        if market.get("question"):
+            candidates.append(str(market["question"]).lower())
+
+        for text in candidates:
+            for key, adjustment in _CATEGORY_ADJUSTMENTS.items():
+                if key in text:
+                    return adjustment
+
+        return (0.0, 0.0)

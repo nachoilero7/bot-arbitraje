@@ -68,6 +68,13 @@ except ImportError:
     _FINNHUB_AVAILABLE = False
 
 try:
+    from src.enrichers.manifold import ManifoldClient
+    from src.signals.metaculus_divergence import MetaculusDivergenceSignal
+    _MANIFOLD_AVAILABLE = True
+except ImportError:
+    _MANIFOLD_AVAILABLE = False
+
+try:
     from src.notifications.telegram import TelegramNotifier
     _TELEGRAM_AVAILABLE = True
 except ImportError:
@@ -203,6 +210,17 @@ class MarketScanner:
                 min_edge=min_edge,
             ))
             logger.info("NewsSentimentSignal enabled (Finnhub)")
+
+        # Manifold Markets cross-platform divergence (gratuito, sin auth)
+        if _MANIFOLD_AVAILABLE:
+            manifold_client = ManifoldClient(proxy=proxy)
+            self.signals.append(MetaculusDivergenceSignal(
+                enricher=manifold_client,
+                source_name="MANIFOLD",
+                fee_rate=fee_rate,
+                min_edge=min_edge,
+            ))
+            logger.info("ManifoldDivergenceSignal enabled (cross-platform, free)")
 
         # Telegram notifier
         if telegram_token and telegram_chat_id and _TELEGRAM_AVAILABLE:

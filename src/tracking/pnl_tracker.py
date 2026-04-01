@@ -119,9 +119,13 @@ class PnLTracker:
 
                 if is_resolved:
                     yes_exit = yes_price
+                    # Preservar el ultimo precio en abierto como closing_price (CLV reference)
+                    prev = self._state.get(cid, {})
+                    closing_price = prev.get("current_price")  # ultimo precio antes de resolver
                     self._state[cid] = {
                         "status": "won" if yes_exit >= 0.99 else "lost",
                         "exit_price": yes_exit,
+                        "closing_price": closing_price,  # para calcular CLV
                         "end_date": end_date,
                     }
                 else:
@@ -235,30 +239,50 @@ class PnLTracker:
         console.print(table)
 
         # Tabla por trade individual
-        det = Table(title="Trades abiertos", box=box.SIMPLE, show_header=True)
+        det = Table(title="Trades", box=box.SIMPLE, show_header=True)
         det.add_column("Señal",    style="dim",          no_wrap=True, max_width=14)
-        det.add_column("Mercado",  style="white",        max_width=42)
+        det.add_column("Mercado",  style="white",        max_width=38)
         det.add_column("Lado",     justify="center",     no_wrap=True)
         det.add_column("Entrada",  justify="right",      no_wrap=True)
         det.add_column("Actual",   justify="right",      no_wrap=True)
+        det.add_column("CLV",      justify="right",      no_wrap=True)
         det.add_column("P&L",      justify="right",      no_wrap=True)
         det.add_column("Estado",   justify="center",     no_wrap=True)
         det.add_column("Cierre",   justify="right", style="dim", no_wrap=True)
+
+        clv_total = 0.0
+        clv_count = 0
 
         for t in sorted(trades, key=lambda x: self._state.get(x["condition_id"], {}).get("end_date", "9999")):
             pnl, status = self._calc_pnl(t)
             state       = self._state.get(t["condition_id"], {})
             end_date    = state.get("end_date", "")
-            # Para trades resueltos mostrar el precio de salida; para abiertos el precio actual
+            side        = t["side"]
+
             if status in ("won", "lost"):
                 exit_p  = state.get("exit_price", 0.0)
-                # Mostrar el precio efectivo del lado de la posicion
-                current = (1.0 - exit_p) if t["side"] == "NO" else exit_p
+                current = (1.0 - exit_p) if side == "NO" else exit_p
             else:
                 current = state.get("current_price", t["price"])
 
-            pnl_str  = f"[green]+${pnl:.2f}[/green]" if pnl >= 0 else f"[red]-${abs(pnl):.2f}[/red]"
-            cierre   = self._format_close(end_date)
+            # CLV: closing_price vs entry_price, desde la perspectiva de la posicion
+            # closing_price = ultimo precio YES conocido antes de la resolucion
+            closing_p = state.get("closing_price")
+            if closing_p is not None:
+                if side == "YES":
+                    clv = closing_p - t["price"]
+                elif side == "NO":
+                    clv = t["price"] - closing_p   # positivo si compraste NO cuando YES era caro
+                else:
+                    clv = 0.0
+                clv_str = f"[green]+{clv:.3f}[/green]" if clv >= 0 else f"[red]{clv:.3f}[/red]"
+                clv_total += clv
+                clv_count += 1
+            else:
+                clv_str = "[dim]—[/dim]"
+
+            pnl_str = f"[green]+${pnl:.2f}[/green]" if pnl >= 0 else f"[red]-${abs(pnl):.2f}[/red]"
+            cierre  = self._format_close(end_date)
 
             if status == "won":
                 estado = "[bold green]GANO[/bold green]"
@@ -269,15 +293,25 @@ class PnLTracker:
 
             det.add_row(
                 (t["signal_type"] or "?")[:14],
-                (t.get("question") or t["condition_id"][:20])[:42],
-                t["side"],
+                (t.get("question") or t["condition_id"][:20])[:38],
+                side,
                 f"{t['price']:.3f}",
                 f"{current:.3f}",
+                clv_str,
                 pnl_str,
                 estado,
                 cierre,
             )
         console.print(det)
+
+        if clv_count > 0:
+            avg_clv = clv_total / clv_count
+            clv_color = "green" if avg_clv >= 0 else "red"
+            console.print(
+                f"[dim]  CLV promedio ({clv_count} trades resueltos): "
+                f"[{clv_color}]{avg_clv:+.4f}[/{clv_color}] "
+                f"({'edge real confirmado' if avg_clv > 0 else 'revisar senales'})[/dim]"
+            )
 
     def _format_close(self, end_date: str) -> str:
         """Formatea el tiempo hasta (o desde) la fecha de cierre de un trade."""
