@@ -98,7 +98,7 @@ class TradeExecutor:
         self._daily_loss: float = 0.0
         self._loss_date: date   = date.today()
         self._trades_today: int = 0
-        self._executed_ids: set = set()  # evitar duplicados por condition_id+side
+        self._executed_ids: set = set()  # evitar duplicados: bloquea condition_id completo (cualquier lado)
         self._lock = threading.Lock()    # serializa maybe_execute entre threads
 
         # Inicializar cliente CLOB
@@ -226,7 +226,7 @@ class TradeExecutor:
             self._save_trade(result)
             self._trades_today += 1
             # Marcar como ejecutado para no repetir
-            self._executed_ids.add(f"{opportunity.condition_id}:{opportunity.side}")
+            self._executed_ids.add(opportunity.condition_id)
             # Contabilizar contra el limite diario de perdidas.
             # Usamos el precio de entrada como costo (perdida maxima posible si el trade
             # va a 0). No sumamos el size completo ya que ganamos cuando el mercado resuelve.
@@ -295,10 +295,9 @@ class TradeExecutor:
             logger.debug(f"[EXECUTOR] Skip {opp.condition_id[:12]} — precio {opp.market_price:.4f} demasiado alto (mercado resuelto)")
             return False
 
-        # No repetir el mismo trade
-        trade_key = f"{opp.condition_id}:{opp.side}"
-        if trade_key in self._executed_ids:
-            logger.debug(f"[EXECUTOR] Skip {opp.condition_id[:12]} — ya ejecutado hoy")
+        # No operar en el mismo mercado dos veces (ningún lado) — evita hedgearse a sí mismo
+        if opp.condition_id in self._executed_ids:
+            logger.debug(f"[EXECUTOR] Skip {opp.condition_id[:12]} — mercado ya operado hoy (bloqueo ambos lados)")
             return False
 
         # Freno de perdidas diarias
