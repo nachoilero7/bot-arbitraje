@@ -75,6 +75,9 @@ class CombinatorialArbSignal(BaseSignal):
         # Tipo 3: mercados mutuamente excluyentes que suman > 1.0
         opportunities.extend(self._detect_mutual_exclusion_violations(markets))
 
+        # Tipo 4: mercados mutuamente excluyentes que suman < 1.0 (arb puro multi-outcome)
+        opportunities.extend(self._detect_multioutcome_parity(markets))
+
         opportunities.sort(key=lambda o: o.edge, reverse=True)
         return opportunities
 
@@ -286,29 +289,30 @@ class CombinatorialArbSignal(BaseSignal):
 
         return groups
 
-    # ── Tipo 3: Mercados mutuamente excluyentes (suma > 1.0) ───────────────────
+    # ── Helpers de agrupacion ───────────────────────────────────────────────────
 
-    def _detect_mutual_exclusion_violations(self, markets: list[dict]) -> list[Opportunity]:
+    # Palabras clave que indican que NO hay exclusion mutua
+    # (multiples outcomes pueden ocurrir simultaneamente)
+    _NON_EXCLUSIVE_KEYWORDS = (
+        "qualify", "advance", "reach the", "make the", "make it to",
+        "go to", "participate", "be relegated", "get relegated",
+    )
+
+    def _group_exclusive_markets(self, markets: list[dict]) -> dict[str, list]:
         """
-        Detecta grupos de mercados mutuamente excluyentes donde la suma de
-        probabilidades supera 1.0, indicando que al menos uno esta sobrevaluado.
+        Agrupa mercados binarios YES/NO que pertenecen al mismo evento mutuamente
+        excluyente (elecciones, premios, torneos con un solo ganador).
 
-        Ejemplo: 'Next PM of Hungary: Orban=0.38, Magyar=0.65' → suma=1.03 → violation
-
-        Agrupa mercados por la 'pregunta base' (removiendo nombres propios y
-        variantes especificas), luego verifica si la suma excede 1.0 + buffer de fees.
+        Clave de grupo: estructura de la pregunta con nombres propios reemplazados
+        por NAME → agrupa 'Will Orban be PM?' y 'Will Magyar be PM?' juntos.
         """
-        opportunities = []
-
-        # Agrupar mercados por pregunta base (sin el sujeto especifico)
         groups: dict[str, list] = defaultdict(list)
 
         for market in markets:
             question = market.get("question", "")
             if not question:
                 continue
-            volume = market.get("volume24hr") or 0
-            if volume < MIN_VOLUME_CONSTRAINT:
+            if (market.get("volume24hr") or 0) < MIN_VOLUME_CONSTRAINT:
                 continue
 
             outcome_prices_raw = market.get("outcomePrices")
@@ -322,20 +326,12 @@ class CombinatorialArbSignal(BaseSignal):
             except Exception:
                 continue
 
-            # Excluir preguntas donde NO hay exclusion mutua:
-            # "qualify", "advance", "reach" → multiples equipos pueden pasar
             q_lower = question.lower()
-            if any(kw in q_lower for kw in (
-                "qualify", "advance", "reach the", "make the", "make it to",
-                "go to", "participate", "be relegated", "get relegated",
-            )):
+            if any(kw in q_lower for kw in self._NON_EXCLUSIVE_KEYWORDS):
                 continue
 
-            # Clave de agrupacion: remover palabras en mayuscula (nombres propios)
-            # y quedarse con la estructura de la pregunta
             base = re.sub(r'\b[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)*\b', 'NAME', question)
             base = re.sub(r'\s+', ' ', base).strip().lower()[:100]
-
             if not base or len(base) < 15:
                 continue
 
@@ -345,24 +341,33 @@ class CombinatorialArbSignal(BaseSignal):
                 "question":  question,
             })
 
+        return groups
+
+    # ── Tipo 3: Mercados mutuamente excluyentes (suma > 1.0) ───────────────────
+
+    def _detect_mutual_exclusion_violations(self, markets: list[dict]) -> list[Opportunity]:
+        """
+        Detecta grupos mutuamente excluyentes donde suma YES > 1.0 + fees:
+        al menos uno esta sobrevaluado → apostar NO en el mas caro.
+        """
+        opportunities = []
+        groups = self._group_exclusive_markets(markets)
+
         for base_q, group in groups.items():
             if len(group) < 2:
                 continue
 
             total_prob = sum(m["yes_price"] for m in group)
-
-            # Violacion: suma de probabilidades supera 1.0 + 2 fees (arbitrage neto positivo)
             edge = total_prob - 1.0 - 2 * self.fee_rate
             if edge < self.min_edge:
                 continue
 
-            # Señalizar el mercado con mayor precio (el mas sobrevaluado del grupo)
             most_overpriced = max(group, key=lambda x: x["yes_price"])
             market = most_overpriced["market"]
             token_ids = json.loads(market.get("clobTokenIds", "[]")) if isinstance(market.get("clobTokenIds"), str) else []
             no_token = token_ids[1] if len(token_ids) > 1 else ""
             no_price = 1.0 - most_overpriced["yes_price"]
-            fair_no  = no_price - edge  # el NO del mas caro deberia ser mayor
+            fair_no  = no_price - edge
 
             opp = Opportunity(
                 signal_type=SignalType.MISPRICED_CORR,
@@ -390,6 +395,93 @@ class CombinatorialArbSignal(BaseSignal):
             logger.info(
                 f"[COMB_ARB] Mutual exclusion violation | {len(group)} markets | "
                 f"sum={total_prob:.3f} edge={edge:.4f} | base='{base_q[:50]}'"
+            )
+
+        return opportunities
+
+    # ── Tipo 4: Multi-outcome parity (suma < 1.0) ──────────────────────────────
+
+    def _detect_multioutcome_parity(self, markets: list[dict]) -> list[Opportunity]:
+        """
+        Detecta grupos mutuamente excluyentes donde la suma de precios YES es
+        MENOR que 1.0 - N*fees → comprar YES en TODOS garantiza profit sin
+        importar quien gana (arbitraje puro multi-outcome).
+
+        Requiere que el grupo capture la mayoria de la probabilidad total
+        (suma >= 0.60) para evitar falsos positivos con longshots parciales
+        (ej: 2 de 100 golfistas no forman un grupo valido).
+
+        Ejemplo valido:
+          Eleccion con 3 candidatos: A=0.28, B=0.35, C=0.22 → suma=0.85
+          Fees totales: 3 * 0.02 = 0.06
+          Bundle edge: 1.0 - 0.85 - 0.06 = 0.09 → arb positivo
+          → comprar YES en los 3 → siempre cobras $1 → profit garantizado
+
+        Crea una Opportunity por mercado del grupo (misma oportunidad, distintos tokens).
+        El executor debe intentar tomar TODAS para que el arb sea risk-free.
+        """
+        # Suma minima del grupo para garantizar que capturamos la mayoria del campo
+        MIN_GROUP_PROB = 0.60
+
+        opportunities = []
+        groups = self._group_exclusive_markets(markets)
+
+        for base_q, group in groups.items():
+            if len(group) < 2:
+                continue
+
+            total_prob = sum(m["yes_price"] for m in group)
+            n = len(group)
+
+            # Descartar grupos que no capturan suficiente probabilidad
+            # (evita agrupar 2 longshots de 100 jugadores)
+            if total_prob < MIN_GROUP_PROB:
+                continue
+
+            total_fees = n * self.fee_rate
+            bundle_edge = 1.0 - total_prob - total_fees
+            if bundle_edge < self.min_edge:
+                continue
+
+            # Crear una Opportunity por cada mercado del grupo
+            group_questions = [m["question"][:35] for m in group]
+            for item in group:
+                market    = item["market"]
+                yes_price = item["yes_price"]
+                token_ids = json.loads(market.get("clobTokenIds", "[]")) if isinstance(market.get("clobTokenIds"), str) else []
+                yes_token = token_ids[0] if token_ids else ""
+
+                # Valor justo proporcional: si la suma total fuera 1.0,
+                # cada candidato valdria yes_price / total_prob
+                fair_value = round(yes_price / total_prob, 5)
+
+                opp = Opportunity(
+                    signal_type=SignalType.PARITY,
+                    condition_id=market.get("conditionId", ""),
+                    question=market.get("question", ""),
+                    category=self._get_category(market),
+                    token_id=yes_token,
+                    side="YES",
+                    market_price=yes_price,
+                    fair_value=fair_value,
+                    edge=round(bundle_edge, 5),
+                    edge_pct=round(bundle_edge / total_prob, 4) if total_prob > 0 else 0,
+                    best_bid=market.get("bestBid") or 0,
+                    best_ask=market.get("bestAsk") or 0,
+                    spread=market.get("spread") or 0,
+                    liquidity_usd=market.get("liquidityNum") or 0,
+                    volume_24h=market.get("volume24hr") or 0,
+                    notes=(
+                        f"MULTI-OUTCOME PARITY | {n} candidatos | "
+                        f"suma={total_prob:.3f} | bundle_edge={bundle_edge:.4f} | "
+                        f"REQUIERE comprar YES en todos: {group_questions}"
+                    ),
+                )
+                opportunities.append(opp)
+
+            logger.info(
+                f"[COMB_ARB] Multi-outcome parity | {n} markets | "
+                f"sum={total_prob:.3f} bundle_edge={bundle_edge:.4f} | base='{base_q[:50]}'"
             )
 
         return opportunities

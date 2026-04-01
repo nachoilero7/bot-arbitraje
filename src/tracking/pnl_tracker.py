@@ -98,25 +98,38 @@ class PnLTracker:
                 cid = m.get("conditionId") or m.get("condition_id", "")
                 if not cid:
                     continue
-                resolved = m.get("resolved", False) or m.get("isResolved", False)
                 end_date = m.get("endDate") or m.get("endDateIso") or ""
-                if resolved:
-                    prices = m.get("outcomePrices", [])
-                    try:
-                        yes_exit = float(prices[0])
-                    except (IndexError, TypeError, ValueError):
-                        yes_exit = 0.5
+
+                # Polymarket marca resolucion con closed=True + outcomePrices extremas
+                # (resolved=None siempre, no usar)
+                closed = m.get("closed", False)
+                prices = m.get("outcomePrices", [])
+                try:
+                    yes_price = float(prices[0]) if prices else None
+                except (IndexError, TypeError, ValueError):
+                    yes_price = None
+
+                is_resolved = closed and yes_price is not None and (yes_price >= 0.99 or yes_price <= 0.01)
+
+                if is_resolved:
+                    yes_exit = yes_price
                     self._state[cid] = {
                         "status": "won" if yes_exit >= 0.99 else "lost",
                         "exit_price": yes_exit,
                         "end_date": end_date,
                     }
                 else:
-                    # Mark-to-market: usar el mejor precio disponible
-                    try:
-                        current = float(m.get("bestBid") or m.get("bestAsk") or 0.5)
-                    except (TypeError, ValueError):
-                        current = 0.5
+                    # Mark-to-market: usar outcomePrices[0] si disponible (más confiable
+                    # que bestBid/bestAsk que se secan cerca de la resolución)
+                    if yes_price is not None:
+                        current = yes_price
+                    else:
+                        try:
+                            bid = m.get("bestBid")
+                            ask = m.get("bestAsk")
+                            current = float(bid or ask or 0.5)
+                        except (TypeError, ValueError):
+                            current = 0.5
                     entry = self._state.get(cid, {})
                     self._state[cid] = {
                         "status": "open",

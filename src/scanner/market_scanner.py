@@ -137,7 +137,7 @@ class MarketScanner:
         ]
         logger.info("LongshotFadeSignal enabled")
         logger.info("PriceDriftSignal enabled")
-        logger.info("CombinatorialArbSignal enabled (incl. mutual exclusion detection)")
+        logger.info("CombinatorialArbSignal enabled (mutual exclusion + multi-outcome parity)")
         logger.info("CalibrationBiasSignal enabled (SSRN 5910522, 124M trades)")
 
         # The Odds API (H2H — free tier)
