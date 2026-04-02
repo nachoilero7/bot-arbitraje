@@ -5,8 +5,10 @@ Modos:
     python main.py                    # Scanner general continuo
     python main.py --once             # Un solo scan y salir
     python main.py --interval 10      # Override del intervalo en segundos
-    python main.py --mode btc         # Solo monitor BTC Up or Down diario
-    python main.py --mode both        # Scanner general + BTC monitor en paralelo
+    python main.py --mode btc         # Solo monitor BTC Up or Down diario (v4 — HAR-RV)
+    python main.py --mode btcv5       # Solo monitor BTC v5 (Deribit IV + calibración + microestructura)
+    python main.py --mode both        # Scanner general + BTC monitor v4 en paralelo
+    python main.py --mode bothv5      # Scanner general + BTC monitor v5 en paralelo
 """
 import argparse
 import time
@@ -38,9 +40,12 @@ def main():
     parser.add_argument("--interval", type=int, default=None, help="Intervalo en segundos entre scans")
     parser.add_argument(
         "--mode",
-        choices=["scanner", "btc", "both"],
+        choices=["scanner", "btc", "btcv5", "both", "bothv5"],
         default="scanner",
-        help="Modo de operacion: scanner (default), btc (BTC Up/Down diario), both (ambos en paralelo)",
+        help=(
+            "Modo de operacion: scanner (default), btc (BTC v4 HAR-RV), "
+            "btcv5 (BTC v5 Deribit ensemble), both (scanner+v4), bothv5 (scanner+v5)"
+        ),
     )
     parser.add_argument("--dry-run", action="store_true", help="Forzar modo simulacion (override DRY_RUN=false en .env)")
     args = parser.parse_args()
@@ -56,8 +61,10 @@ def main():
 
     mode_label = {
         "scanner": "Scanner General",
-        "btc":     "BTC Up/Down Monitor",
-        "both":    "Scanner General + BTC Monitor",
+        "btc":     "BTC Up/Down Monitor v4",
+        "btcv5":   "BTC Up/Down Monitor v5 (Deribit ensemble)",
+        "both":    "Scanner General + BTC Monitor v4",
+        "bothv5":  "Scanner General + BTC Monitor v5",
     }[args.mode]
 
     console.print(Panel.fit(
@@ -97,10 +104,16 @@ def main():
 
     # ── BTC Monitor ────────────────────────────────────────────────────────────
     btc_monitor = None
-    if args.mode in ("btc", "both"):
-        from src.monitors.btc_arb_monitor import BtcArbMonitor
+    if args.mode in ("btc", "both", "btcv5", "bothv5"):
+        if args.mode in ("btcv5", "bothv5"):
+            from src.monitors.btc_arb_monitor_v5 import BtcArbMonitorV5 as _BtcCls
+            min_edge_btc = float(os.getenv("MIN_EDGE_BTC", "0.10"))
+            version_tag  = "v5"
+        else:
+            from src.monitors.btc_arb_monitor import BtcArbMonitor as _BtcCls
+            min_edge_btc = float(os.getenv("MIN_EDGE_BTC", "0.09"))
+            version_tag  = "v4"
 
-        # Construir notifier y executor standalone para el monitor BTC
         notifier = None
         executor = None
 
@@ -133,17 +146,17 @@ def main():
         except ImportError:
             pass
 
-        btc_monitor = BtcArbMonitor(
+        btc_monitor = _BtcCls(
             executor=executor,
             notifier=notifier,
-            min_edge=float(os.getenv("MIN_EDGE_BTC", "0.09")),
+            min_edge=min_edge_btc,
             dry_run=dry_run,
             bankroll_usd=bankroll_usd,
         )
         btc_monitor.start()
 
         mode_str = "DRY RUN" if dry_run else "LIVE"
-        logger.info(f"[BTC ARB] Monitor diario iniciado [{mode_str}]")
+        logger.info(f"[BTC ARB {version_tag}] Monitor iniciado [{mode_str}]")
 
     # ── P&L Tracker ────────────────────────────────────────────────────────────
     pnl_tracker = None
@@ -156,7 +169,7 @@ def main():
         logger.warning(f"[PNL] Tracker no disponible: {e}")
 
     # ── Scanner General ────────────────────────────────────────────────────────
-    if args.mode in ("scanner", "both"):
+    if args.mode in ("scanner", "both", "bothv5"):
         client = GammaApiClient(
             timeout=api_cfg.get("request_timeout", 15),
             max_retries=api_cfg.get("max_retries", 3),
@@ -213,9 +226,9 @@ def main():
                         break
                     time.sleep(1)
 
-    elif args.mode == "btc":
+    elif args.mode in ("btc", "btcv5"):
         # Solo BTC monitor — el main thread duerme mientras el monitor corre en background
-        logger.info("[BTC ARB] Corriendo en modo BTC-only. Ctrl+C para detener.")
+        logger.info(f"[BTC ARB] Corriendo en modo BTC-only ({args.mode}). Ctrl+C para detener.")
         while running:
             time.sleep(1)
 
