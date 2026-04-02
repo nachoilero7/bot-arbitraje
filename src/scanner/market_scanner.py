@@ -138,13 +138,14 @@ class MarketScanner:
         self.signals: list[BaseSignal] = [
             ParitySignal(fee_rate=fee_rate, min_edge=min_edge),
             SpreadSignal(fee_rate=fee_rate, min_edge=min_edge),
-            LongshotFadeSignal(fee_rate=fee_rate, min_edge=min_edge),
             PriceDriftSignal(fee_rate=fee_rate, min_edge=min_edge),
             CombinatorialArbSignal(fee_rate=fee_rate, min_edge=min_edge),
             CalibrationBiasSignal(fee_rate=fee_rate, min_edge=min_edge),
+            # LongshotFadeSignal: DESACTIVADA — factores 0.88/1.15 sin respaldo empírico.
+            # El paper SSRN 5910522 documenta sesgo de 3-5%, no 12-15%. Necesita recalibración.
+            # LongshotFadeSignal(fee_rate=fee_rate, min_edge=min_edge),
         ]
-        logger.info("LongshotFadeSignal enabled")
-        logger.info("PriceDriftSignal enabled")
+        logger.info("PriceDriftSignal enabled (v2: price floor 7/93%, min 5min span)")
         logger.info("CombinatorialArbSignal enabled (mutual exclusion + multi-outcome parity)")
         logger.info("CalibrationBiasSignal enabled (SSRN 5910522, 124M trades)")
 
@@ -187,30 +188,15 @@ class MarketScanner:
             ))
             logger.info("OrderBookImbalanceSignal enabled (CLOB API)")
 
-        # On-chain whale tracking via Alchemy (Polygon)
+        # WhaleSignal: DESACTIVADA — get_whale_pressure() es caja negra sin validación.
+        # El fair value adjustment (ratio-0.5)*0.20 no tiene respaldo teórico.
+        # Reactivar solo después de validar WhaleTracker con datos reales.
         self._alchemy_whale: AlchemyWhaleTracker | None = None
-        if alchemy_api_key and _ALCHEMY_AVAILABLE and _CLOB_SIGNALS_AVAILABLE:
-            try:
-                self._alchemy_whale = AlchemyWhaleTracker(api_key=alchemy_api_key)
-                self._alchemy_whale.start()
-                self.signals.append(WhaleSignal(
-                    whale_tracker=self._alchemy_whale,
-                    fee_rate=fee_rate,
-                    min_edge=min_edge,
-                ))
-                logger.info("WhaleSignal enabled (Alchemy on-chain, Polygon)")
-            except Exception as e:
-                logger.warning(f"AlchemyWhaleTracker init failed: {e}")
+        # (Alchemy API key disponible pero señal desactivada)
 
-        # Finnhub news sentiment
-        if finnhub_api_key and _FINNHUB_AVAILABLE:
-            finnhub_client = FinnhubClient(api_key=finnhub_api_key)
-            self.signals.append(NewsSentimentSignal(
-                finnhub_client=finnhub_client,
-                fee_rate=fee_rate,
-                min_edge=min_edge,
-            ))
-            logger.info("NewsSentimentSignal enabled (Finnhub)")
+        # NewsSentimentSignal: DESACTIVADA — matching por 7 keywords hardcodeadas,
+        # sin contexto semántico. Genera falsos positivos sistemáticos.
+        # Reactivar solo con modelo NLP real (transformers, VADER calibrado).
 
         # Manifold Markets cross-platform divergence (gratuito, sin auth)
         if _MANIFOLD_AVAILABLE:
