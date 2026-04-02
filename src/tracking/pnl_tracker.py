@@ -32,10 +32,11 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 
 class PnLTracker:
 
-    def __init__(self, trades_csv: str = "data/trades.csv", proxy: str = None):
+    def __init__(self, trades_csv: str = "data/trades.csv", proxy: str = None, notifier=None):
         self.trades_csv = trades_csv
         self.state_file = "data/pnl_state.json"
-        self._proxies = {"https": proxy, "http": proxy} if proxy else None
+        self._proxies   = {"https": proxy, "http": proxy} if proxy else None
+        self.notifier   = notifier
         self._state: dict = self._load_state()   # condition_id → {status, exit_price, current_price}
 
     # ── Public API ─────────────────────────────────────────────────────────────
@@ -55,10 +56,38 @@ class PnLTracker:
         if not open_ids:
             return
 
+        # Snapshot del estado antes de actualizar (para detectar transiciones)
+        pre_state = {cid: self._state[cid].get("status", "open") for cid in open_ids if cid in self._state}
+
         logger.debug(f"[PNL] Actualizando {len(open_ids)} mercados abiertos...")
         for i in range(0, len(open_ids), 20):
             self._fetch_batch(open_ids[i:i + 20])
         self._save_state()
+
+        # Detectar transiciones open → won/lost y notificar por Telegram
+        if self.notifier:
+            trade_by_cid = {t["condition_id"]: t for t in live}
+            for cid in open_ids:
+                was_open    = pre_state.get(cid, "open") == "open"
+                new_status  = self._state.get(cid, {}).get("status", "open")
+                is_resolved = new_status in ("won", "lost")
+                if was_open and is_resolved:
+                    trade = trade_by_cid.get(cid)
+                    if not trade:
+                        continue
+                    pnl, pos_status = self._calc_pnl(trade)
+                    try:
+                        self.notifier.notify_trade_closed(
+                            question=trade.get("question") or cid[:20],
+                            side=trade["side"],
+                            entry_price=trade["price"],
+                            position_usd=trade["position_usd"],
+                            pnl=pnl,
+                            won=(pos_status == "won"),
+                            dry_run=False,
+                        )
+                    except Exception as _e:
+                        logger.debug(f"[PNL] Telegram notify error: {_e}")
 
     def print_summary(self):
         """Imprime resumen de P&L en consola. Funciona en dry_run y live."""

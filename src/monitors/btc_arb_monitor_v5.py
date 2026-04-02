@@ -807,12 +807,14 @@ class BtcArbMonitorV5:
                 f"side={side} price={p_mkt:.3f} fair={p_true:.3f} edge={edge:+.4f}"
             )
             if self.notifier:
-                self.notifier._send(
-                    f"[BTC v5] {question[:80]}\n"
-                    f"Side: {side} @ {p_mkt:.3f} | fair={p_true:.3f} | edge={edge:+.4f}\n"
-                    f"BTC: ${btc_price:,.0f} vs K=${strike:,.0f} | {hours_left:.1f}h restantes\n"
-                    f"Deribit={p_deribit:.3f} | Empírica={p_empirical:.3f} | Micro={micro_adj:+.3f}\n"
-                    f"σ_HAR={self._har_vol:.4f} | fee={fee:.2%} | fund={self._funding_rate:+.6f}"
+                self.notifier.notify_trade_opened(
+                    question=question,
+                    side="YES" if side == "UP" else "NO",
+                    entry_price=p_mkt,
+                    position_usd=self.bankroll_usd * 0.10,   # estimado
+                    signal_type="BTC_ARB_v5",
+                    edge=edge,
+                    dry_run=True,
                 )
             return
 
@@ -855,18 +857,9 @@ class BtcArbMonitorV5:
         )
 
         result = self.executor.maybe_execute(opp)
-        if result:
-            mode = "DRY RUN" if result.dry_run else "TRADE"
-            msg = (
-                f"[BTC v5 {mode}] {question[:80]}\n"
-                f"Side: {side} @ {result.price:.3f} | ${result.position_usd:.2f} | edge={edge:+.4f}\n"
-                f"BTC: ${btc_price:,.0f} vs K=${strike:,.0f} | {hours_left:.1f}h left\n"
-                f"Deribit={p_deribit:.3f} | Empírica={p_empirical:.3f} | Micro={micro_adj:+.3f}"
-            )
-            if not result.dry_run:
-                msg += f"\nOrder ID: {result.order_id}"
-            if self.notifier:
-                self.notifier._send(msg)
+        # La notificación de trade abierto es manejada por TradeExecutor.
+        if result and not result.dry_run and result.order_id:
+            logger.info(f"[BTC v5 TRADE] Order ID: {result.order_id}")
 
     # ── HAR-RV (fallback cuando Deribit no está disponible) ───────────────────
 

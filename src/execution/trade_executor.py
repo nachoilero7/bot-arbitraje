@@ -84,6 +84,7 @@ class TradeExecutor:
         dry_run: bool = True,
         trades_csv: str = "data/trades.csv",
         proxy_address: str = None,         # Gnosis Safe (funder) — POLY_GNOSIS_SAFE mode
+        notifier=None,                     # TelegramNotifier (opcional)
     ):
         self.bankroll_usd           = bankroll_usd
         self.min_edge_to_trade      = min_edge_to_trade
@@ -95,6 +96,7 @@ class TradeExecutor:
         self.trades_csv        = trades_csv
 
         self._proxy_address    = proxy_address   # None = EOA, str = POLY_GNOSIS_SAFE
+        self.notifier          = notifier
         self._daily_loss: float = 0.0
         self._loss_date: date   = date.today()
         self._trades_today: int = 0
@@ -227,6 +229,21 @@ class TradeExecutor:
             self._trades_today += 1
             # Marcar como ejecutado para no repetir
             self._executed_ids.add(opportunity.condition_id)
+            # Notificar por Telegram cuando el trade es exitoso
+            if result.success and self.notifier:
+                try:
+                    self.notifier.notify_trade_opened(
+                        question=opportunity.question,
+                        side=opportunity.side,
+                        entry_price=result.price,
+                        position_usd=result.position_usd,
+                        signal_type=opportunity.signal_type.value,
+                        edge=opportunity.edge,
+                        dry_run=result.dry_run,
+                        order_id=result.order_id,
+                    )
+                except Exception as _e:
+                    logger.debug(f"[EXECUTOR] Telegram notify error: {_e}")
             # Contabilizar contra el limite diario de perdidas.
             # Usamos el precio de entrada como costo (perdida maxima posible si el trade
             # va a 0). No sumamos el size completo ya que ganamos cuando el mercado resuelve.

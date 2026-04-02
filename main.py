@@ -162,7 +162,18 @@ def main():
     pnl_tracker = None
     try:
         from src.tracking.pnl_tracker import PnLTracker
-        pnl_tracker = PnLTracker(trades_csv="data/trades.csv", proxy=proxy)
+        # notifier puede ser None si Telegram no está configurado — PnLTracker lo tolera
+        _pnl_notifier = None
+        try:
+            if telegram_token and telegram_chat_id:
+                from src.notifications.telegram import TelegramNotifier
+                _pnl_notifier = TelegramNotifier(
+                    bot_token=telegram_token,
+                    chat_id=telegram_chat_id,
+                )
+        except Exception:
+            pass
+        pnl_tracker = PnLTracker(trades_csv="data/trades.csv", proxy=proxy, notifier=_pnl_notifier)
         pnl_tracker.update()
         pnl_tracker.print_summary()
     except Exception as e:

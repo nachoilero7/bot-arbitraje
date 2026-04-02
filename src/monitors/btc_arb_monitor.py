@@ -516,17 +516,19 @@ class BtcArbMonitor:
         condition_id = market.get("conditionId", "")
 
         if not self.executor:
-            mode = "DRY RUN (sin executor)"
             logger.info(
-                f"[BTC ARB {mode}] {question[:60]} | "
+                f"[BTC ARB DRY RUN] {question[:60]} | "
                 f"side={side} price={p_mkt:.3f} fair={p_true:.3f} edge={edge:+.4f}"
             )
             if self.notifier:
-                self.notifier._send(
-                    f"[BTC ARB] {question[:80]}\n"
-                    f"Side: {side} @ {p_mkt:.3f} | fair={p_true:.3f} | edge={edge:+.4f}\n"
-                    f"BTC: ${btc_price:,.0f} vs K=${strike:,.0f} | {hours_left:.1f}h restantes\n"
-                    f"sigma_HAR={self._har_vol:.4f} | fund={self._funding_rate:+.6f}"
+                self.notifier.notify_trade_opened(
+                    question=question,
+                    side="YES" if side == "UP" else "NO",
+                    entry_price=p_mkt,
+                    position_usd=self.bankroll_usd * 0.10,   # estimado
+                    signal_type="BTC_ARB_v4",
+                    edge=edge,
+                    dry_run=True,
                 )
             return
 
@@ -571,17 +573,10 @@ class BtcArbMonitor:
         )
 
         result = self.executor.maybe_execute(opp)
-        if result:
-            mode = "DRY RUN" if result.dry_run else "TRADE"
-            msg = (
-                f"[BTC ARB {mode}] {question[:80]}\n"
-                f"Side: {side} @ {result.price:.3f} | ${result.position_usd:.2f} | edge={edge:+.4f}\n"
-                f"BTC: ${btc_price:,.0f} vs K=${strike:,.0f} | {hours_left:.1f}h left"
-            )
-            if not result.dry_run:
-                msg += f"\nOrder ID: {result.order_id}"
-            if self.notifier:
-                self.notifier._send(msg)
+        # La notificación de trade abierto es manejada por TradeExecutor.
+        # Solo loguear el order_id en live para referencia.
+        if result and not result.dry_run and result.order_id:
+            logger.info(f"[BTC ARB TRADE] Order ID: {result.order_id}")
 
     # ── Helpers ─────────────────────────────────────────────────────────────
 

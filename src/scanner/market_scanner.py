@@ -247,6 +247,7 @@ class MarketScanner:
                 max_days_to_resolution=max_days_to_resolution,
                 dry_run=dry_run,
                 proxy_address=polygon_proxy_address,
+                notifier=self.notifier,
             )
             mode = "DRY RUN" if dry_run else "LIVE"
             logger.info(f"TradeExecutor enabled [{mode}]")
@@ -394,26 +395,12 @@ class MarketScanner:
             self._print_opportunities(opportunities, scan_num, len(markets))
             self._save_opportunities(opportunities)
 
-            if self.notifier and not self.executor:
-                self.notifier.notify_opportunities(opportunities, scan_num)
-                if scan_num % 10 == 0:
-                    top = opportunities[0].edge if opportunities else 0
-                    self.notifier.send_summary(len(opportunities), top, scan_num)
-
             # Phase 2: ejecutar trades en oportunidades de alta confianza
+            # Las notificaciones Telegram son manejadas por TradeExecutor (trade abierto)
+            # y PnLTracker (trade cerrado). No se notifican edges detectados sin ejecutar.
             if self.executor:
                 for opp in opportunities:
-                    result = self.executor.maybe_execute(opp)
-                    if result and self.notifier:
-                        mode = "DRY RUN" if result.dry_run else "TRADE"
-                        msg = (
-                            f"[{mode}] {opp.signal_type.value}\n"
-                            f"{opp.question[:60]}\n"
-                            f"Side: {opp.side} @ {result.price:.3f} | ${result.position_usd:.2f} | edge={opp.edge:.4f}"
-                        )
-                        if not result.dry_run:
-                            msg += f"\nOrder ID: {result.order_id}"
-                        self.notifier._send(msg)
+                    self.executor.maybe_execute(opp)
 
             return opportunities
         except Exception as e:
