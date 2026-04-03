@@ -128,6 +128,7 @@ class MarketScanner:
         max_days_to_resolution: int = 7,
         dry_run: bool = True,
         polygon_proxy_address: str = None,  # Privy proxy wallet (POLY_PROXY mode)
+        executor=None,   # TradeExecutor compartido — si se pasa, no se crea uno interno
     ):
         self.client = client
         self.min_liquidity_usd = min_liquidity_usd
@@ -233,8 +234,13 @@ class MarketScanner:
             logger.info("Telegram notifications enabled")
 
         # Trade executor (Phase 2)
-        self.executor = None
-        if clob_private_key and clob_api_key and _EXECUTOR_AVAILABLE:
+        # Si se pasa un executor externo (compartido con el BTC monitor), usarlo directamente.
+        # Así un solo _executed_ids bloquea duplicados entre señales de scanner y monitor BTC.
+        if executor is not None:
+            self.executor = executor
+            mode = "DRY RUN" if executor.dry_run else "LIVE"
+            logger.info(f"TradeExecutor (compartido) vinculado [{mode}]")
+        elif clob_private_key and clob_api_key and _EXECUTOR_AVAILABLE:
             self.executor = TradeExecutor(
                 private_key=clob_private_key,
                 api_key=clob_api_key,
@@ -250,7 +256,9 @@ class MarketScanner:
                 notifier=self.notifier,
             )
             mode = "DRY RUN" if dry_run else "LIVE"
-            logger.info(f"TradeExecutor enabled [{mode}]")
+            logger.info(f"TradeExecutor (interno) creado [{mode}]")
+        else:
+            self.executor = None
 
         self._ensure_csv()
 

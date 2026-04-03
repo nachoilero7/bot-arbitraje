@@ -102,6 +102,47 @@ def main():
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
+    # ── Notifier (Telegram) ────────────────────────────────────────────────────
+    # Instancia única compartida entre scanner, BTC monitor y P&L tracker.
+    notifier = None
+    try:
+        from src.notifications.telegram import TelegramNotifier
+        if telegram_token and telegram_chat_id:
+            notifier = TelegramNotifier(
+                bot_token=telegram_token,
+                chat_id=telegram_chat_id,
+                min_notify_edge=float(os.getenv("TELEGRAM_MIN_EDGE", "0.05")),
+            )
+    except ImportError:
+        pass
+
+    # ── Executor (TradeExecutor compartido) ────────────────────────────────────
+    # UN SOLO executor para todos los modos. Así _executed_ids es compartido:
+    # un trade en el BTC monitor bloquea ese conditionId en el scanner y viceversa.
+    # También persiste _executed_ids y _daily_loss a disco para sobrevivir reinicios.
+    shared_executor = None
+    try:
+        from src.execution.trade_executor import TradeExecutor
+        if clob_private_key and clob_api_key:
+            shared_executor = TradeExecutor(
+                private_key=clob_private_key,
+                api_key=clob_api_key,
+                api_secret=clob_api_secret,
+                api_passphrase=clob_api_passphrase,
+                bankroll_usd=bankroll_usd,
+                max_position_usd=max_position_usd,
+                max_daily_loss_usd=max_daily_loss_usd,
+                min_edge_to_trade=min_edge_to_trade,
+                max_days_to_resolution=max_days_to_resolution,
+                dry_run=dry_run,
+                proxy_address=polygon_proxy_addr,
+                notifier=notifier,
+            )
+            mode_str = "DRY RUN" if dry_run else "LIVE"
+            logger.info(f"[EXECUTOR] Instancia compartida creada [{mode_str}]")
+    except ImportError:
+        pass
+
     # ── BTC Monitor ────────────────────────────────────────────────────────────
     btc_monitor = None
     if args.mode in ("btc", "both", "btcv5", "bothv5"):
@@ -114,47 +155,14 @@ def main():
             min_edge_btc = float(os.getenv("MIN_EDGE_BTC", "0.09"))
             version_tag  = "v4"
 
-        notifier = None
-        executor = None
-
-        try:
-            from src.notifications.telegram import TelegramNotifier
-            if telegram_token and telegram_chat_id:
-                notifier = TelegramNotifier(
-                    bot_token=telegram_token,
-                    chat_id=telegram_chat_id,
-                    min_notify_edge=float(os.getenv("TELEGRAM_MIN_EDGE", "0.05")),
-                )
-        except ImportError:
-            pass
-
-        try:
-            from src.execution.trade_executor import TradeExecutor
-            if clob_private_key and clob_api_key:
-                executor = TradeExecutor(
-                    private_key=clob_private_key,
-                    api_key=clob_api_key,
-                    api_secret=clob_api_secret,
-                    api_passphrase=clob_api_passphrase,
-                    bankroll_usd=bankroll_usd,
-                    max_position_usd=max_position_usd,
-                    max_daily_loss_usd=max_daily_loss_usd,
-                    max_days_to_resolution=max_days_to_resolution,
-                    dry_run=dry_run,
-                    proxy_address=polygon_proxy_addr,
-                )
-        except ImportError:
-            pass
-
         btc_monitor = _BtcCls(
-            executor=executor,
+            executor=shared_executor,   # executor compartido — bloquea cross-signal
             notifier=notifier,
             min_edge=min_edge_btc,
             dry_run=dry_run,
             bankroll_usd=bankroll_usd,
         )
         btc_monitor.start()
-
         mode_str = "DRY RUN" if dry_run else "LIVE"
         logger.info(f"[BTC ARB {version_tag}] Monitor iniciado [{mode_str}]")
 
@@ -162,18 +170,7 @@ def main():
     pnl_tracker = None
     try:
         from src.tracking.pnl_tracker import PnLTracker
-        # notifier puede ser None si Telegram no está configurado — PnLTracker lo tolera
-        _pnl_notifier = None
-        try:
-            if telegram_token and telegram_chat_id:
-                from src.notifications.telegram import TelegramNotifier
-                _pnl_notifier = TelegramNotifier(
-                    bot_token=telegram_token,
-                    chat_id=telegram_chat_id,
-                )
-        except Exception:
-            pass
-        pnl_tracker = PnLTracker(trades_csv="data/trades.csv", proxy=proxy, notifier=_pnl_notifier)
+        pnl_tracker = PnLTracker(trades_csv="data/trades.csv", proxy=proxy, notifier=notifier)
         pnl_tracker.update()
         pnl_tracker.print_summary()
     except Exception as e:
@@ -202,17 +199,7 @@ def main():
             telegram_min_edge=float(os.getenv("TELEGRAM_MIN_EDGE", "0.05")),
             proxy=proxy,
             alchemy_api_key=alchemy_api_key,
-            clob_private_key=clob_private_key,
-            clob_api_key=clob_api_key,
-            clob_api_secret=clob_api_secret,
-            clob_api_passphrase=clob_api_passphrase,
-            bankroll_usd=bankroll_usd,
-            max_position_usd=max_position_usd,
-            max_daily_loss_usd=max_daily_loss_usd,
-            min_edge_to_trade=min_edge_to_trade,
-            max_days_to_resolution=max_days_to_resolution,
-            dry_run=dry_run,
-            polygon_proxy_address=polygon_proxy_addr,
+            executor=shared_executor,   # executor compartido — no crea uno propio
         )
 
         scan_num = 0

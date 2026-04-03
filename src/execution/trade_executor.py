@@ -13,6 +13,7 @@ Seguridad:
   - Kelly fraccional al 25% del Kelly completo
 """
 import csv
+import json
 import os
 import threading
 from datetime import datetime, date
@@ -102,6 +103,10 @@ class TradeExecutor:
         self._trades_today: int = 0
         self._executed_ids: set = set()  # evitar duplicados: bloquea condition_id completo (cualquier lado)
         self._lock = threading.Lock()    # serializa maybe_execute entre threads
+        self._state_file = "data/executor_state.json"
+
+        # Cargar estado persistido del dia actual (sobrevive reinicios del bot)
+        self._load_state()
 
         # Inicializar cliente CLOB
         creds = ApiCreds(
@@ -152,11 +157,13 @@ class TradeExecutor:
             return self._maybe_execute_locked(opportunity)
 
     def _maybe_execute_locked(self, opportunity: Opportunity) -> TradeResult | None:
-        # Reset contador diario si cambio el dia
+        # Reset diario si cambio el dia — limpiar estado persistido tambien
         if date.today() != self._loss_date:
-            self._daily_loss  = 0.0
-            self._loss_date   = date.today()
+            self._daily_loss   = 0.0
+            self._loss_date    = date.today()
             self._trades_today = 0
+            self._executed_ids.clear()
+            self._save_state()
 
         # Filtros de seguridad
         if not self._passes_filters(opportunity):
@@ -227,8 +234,9 @@ class TradeExecutor:
         if result:
             self._save_trade(result)
             self._trades_today += 1
-            # Marcar como ejecutado para no repetir
+            # Marcar como ejecutado para no repetir — persistir en disco para sobrevivir reinicios
             self._executed_ids.add(opportunity.condition_id)
+            self._save_state()
             # Notificar por Telegram cuando el trade es exitoso
             if result.success and self.notifier:
                 try:
@@ -459,6 +467,47 @@ class TradeExecutor:
             success=success,
             error="; ".join(errors),
         )
+
+    # ── Persistencia de estado diario ─────────────────────────────────────────
+
+    def _load_state(self):
+        """
+        Restaura executed_ids y daily_loss del dia actual al iniciar.
+        Si el archivo es de otro dia, lo ignora (reset automatico).
+        Evita que reinicios del bot repitan trades ya ejecutados hoy
+        o que se pierda el conteo de perdidas diarias.
+        """
+        if not os.path.exists(self._state_file):
+            return
+        try:
+            with open(self._state_file, encoding="utf-8") as f:
+                data = json.load(f)
+            saved_date = date.fromisoformat(data.get("date", ""))
+            if saved_date != date.today():
+                return   # datos de otro dia, ignorar
+            self._executed_ids = set(data.get("executed_ids", []))
+            self._daily_loss   = float(data.get("daily_loss", 0.0))
+            n = len(self._executed_ids)
+            if n:
+                logger.info(
+                    f"[EXECUTOR] Estado restaurado: {n} mercados ya ejecutados hoy, "
+                    f"daily_loss=${self._daily_loss:.2f}"
+                )
+        except Exception as e:
+            logger.debug(f"[EXECUTOR] No se pudo cargar estado: {e}")
+
+    def _save_state(self):
+        """Persiste executed_ids y daily_loss a disco."""
+        os.makedirs("data", exist_ok=True)
+        try:
+            with open(self._state_file, "w", encoding="utf-8") as f:
+                json.dump({
+                    "date":         date.today().isoformat(),
+                    "executed_ids": list(self._executed_ids),
+                    "daily_loss":   round(self._daily_loss, 4),
+                }, f)
+        except Exception as e:
+            logger.debug(f"[EXECUTOR] No se pudo guardar estado: {e}")
 
     def _ensure_csv(self):
         os.makedirs("data", exist_ok=True)
