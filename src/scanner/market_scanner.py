@@ -8,7 +8,9 @@ Cada N segundos:
 4. Muestra tabla Rich + guarda CSV + notifica Telegram
 """
 import csv
+import json
 import os
+from collections import deque
 from datetime import datetime, timezone, timedelta
 
 from rich.console import Console
@@ -20,7 +22,6 @@ from src.signals.base import BaseSignal, Opportunity
 from src.signals.parity import ParitySignal
 from src.signals.spread import SpreadSignal
 from src.signals.longshot_fade import LongshotFadeSignal
-from src.signals.price_drift import PriceDriftSignal
 from src.signals.combinatorial_arb import CombinatorialArbSignal
 from src.signals.calibration_bias import CalibrationBiasSignal
 from src.utils.logger import get_logger
@@ -139,14 +140,9 @@ class MarketScanner:
         self.signals: list[BaseSignal] = [
             ParitySignal(fee_rate=fee_rate, min_edge=min_edge),
             SpreadSignal(fee_rate=fee_rate, min_edge=min_edge),
-            PriceDriftSignal(fee_rate=fee_rate, min_edge=min_edge),
             CombinatorialArbSignal(fee_rate=fee_rate, min_edge=min_edge),
             CalibrationBiasSignal(fee_rate=fee_rate, min_edge=min_edge),
-            # LongshotFadeSignal: DESACTIVADA — factores 0.88/1.15 sin respaldo empírico.
-            # El paper SSRN 5910522 documenta sesgo de 3-5%, no 12-15%. Necesita recalibración.
-            # LongshotFadeSignal(fee_rate=fee_rate, min_edge=min_edge),
         ]
-        logger.info("PriceDriftSignal enabled (v2: price floor 7/93%, min 5min span)")
         logger.info("CombinatorialArbSignal enabled (mutual exclusion + multi-outcome parity)")
         logger.info("CalibrationBiasSignal enabled (SSRN 5910522, 124M trades)")
 
@@ -260,6 +256,9 @@ class MarketScanner:
         else:
             self.executor = None
 
+        # Historial de precios YES por mercado — para calcular price_trend
+        self._price_history: dict = {}   # condition_id → deque(maxlen=8) de float (yes_price)
+
         self._ensure_csv()
 
     def _filter_markets(self, markets: list[dict]) -> list[dict]:
@@ -342,11 +341,13 @@ class MarketScanner:
         table.add_column("Spread",    style="dim",        no_wrap=True, justify="right")
         table.add_column("Liq $",     style="green dim",  no_wrap=True, justify="right")
         table.add_column("Vol 24h $", style="dim",        no_wrap=True, justify="right")
+        table.add_column("Conf",  style="cyan dim",   no_wrap=True, justify="center")
 
         for opp in opportunities[:25]:
             edge_color = "bright_green" if opp.edge >= 0.06 else "green"
             liq = f"{opp.liquidity_usd:>8,.0f}" if opp.liquidity_usd else "    -"
             vol = f"{opp.volume_24h:>8,.0f}"    if opp.volume_24h    else "    -"
+            consensus_str = f"[bold cyan]{opp.consensus_count}✓[/bold cyan]" if opp.consensus_count >= 2 else "[dim]1[/dim]"
             table.add_row(
                 opp.signal_type.value[:15],
                 (opp.question or "-")[:52],
@@ -357,6 +358,7 @@ class MarketScanner:
                 f"{opp.spread:.3f}",
                 liq,
                 vol,
+                consensus_str,
             )
 
         console.print(table)
@@ -385,6 +387,80 @@ class MarketScanner:
                     opp.notes,
                 ])
 
+    def _enrich_opportunities(
+        self, opportunities: list[Opportunity], markets: list[dict]
+    ) -> list[Opportunity]:
+        """
+        Enriquece cada oportunidad con dos métricas de confianza:
+
+        1. consensus_count: cuántas señales independientes detectaron el mismo
+           trade (mismo condition_id, mismo lado). Más señales acordando = más confianza.
+
+        2. price_trend: cambio reciente del precio YES hacia nuestro fair_value.
+           Positivo = mercado moviéndose a nuestro favor (el edge está siendo "descubierto").
+           Negativo = precio moviéndose en contra (posible flujo informado adverso).
+
+        También deduplica: por cada (condition_id, side), conserva solo la oportunidad
+        con mayor edge y le asigna el consensus_count del grupo.
+        """
+        # ── 1. Actualizar historial de precios ────────────────────────────────
+        for m in markets:
+            cid = m.get("conditionId", "")
+            if not cid:
+                continue
+            try:
+                raw = m.get("outcomePrices", "[0.5,0.5]")
+                prices = json.loads(raw) if isinstance(raw, str) else raw
+                yes_price = float(prices[0]) if prices else None
+            except Exception:
+                yes_price = None
+            if yes_price is not None:
+                if cid not in self._price_history:
+                    self._price_history[cid] = deque(maxlen=8)
+                self._price_history[cid].append(yes_price)
+
+        # ── 2. Agrupar por (condition_id, side) para consensus_count ─────────
+        groups: dict = {}   # (condition_id, side) → list of Opportunity
+        for opp in opportunities:
+            key = (opp.condition_id, opp.side)
+            groups.setdefault(key, []).append(opp)
+
+        # ── 3. Calcular price_trend y aplicar consensus_count ─────────────────
+        result = []
+        for (cid, side), group in groups.items():
+            # Tomar la oportunidad con mayor edge del grupo
+            best = max(group, key=lambda o: o.edge)
+
+            # Consensus: cuántos signal_types distintos están de acuerdo
+            unique_signals = {o.signal_type for o in group}
+            best.consensus_count = len(unique_signals)
+
+            # Price trend: cambio reciente del YES hacia nuestro fair_value
+            history = list(self._price_history.get(cid, []))
+            if len(history) >= 3:
+                # Cambio entre el precio más antiguo disponible y el actual
+                oldest = history[0]
+                latest = history[-1]
+                raw_change = latest - oldest   # positivo = precio YES subió
+
+                # Normalizar por el fair_value para que tenga sentido independiente del precio
+                # Si side=YES: queremos que YES suba → cambio positivo es buena señal
+                # Si side=NO:  queremos que YES baje → cambio negativo es buena señal
+                if side == "YES":
+                    best.price_trend = raw_change
+                elif side == "NO":
+                    best.price_trend = -raw_change
+                else:
+                    best.price_trend = 0.0
+            else:
+                best.price_trend = 0.0   # sin historial suficiente
+
+            result.append(best)
+
+        # Ordenar por edge desc (igual que antes)
+        result.sort(key=lambda o: o.edge, reverse=True)
+        return result
+
     def scan_once(self, scan_num: int = 1) -> list[Opportunity]:
         try:
             markets = self.client.get_all_active_markets(
@@ -399,6 +475,9 @@ class MarketScanner:
             for opp in opportunities:
                 m = market_by_cid.get(opp.condition_id, {})
                 opp.end_date = m.get("endDate", "") or m.get("endDateIso", "")
+
+            # Enriquecer con consensus_count y price_trend
+            opportunities = self._enrich_opportunities(opportunities, markets)
 
             self._print_opportunities(opportunities, scan_num, len(markets))
             self._save_opportunities(opportunities)

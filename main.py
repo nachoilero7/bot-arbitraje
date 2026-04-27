@@ -1,14 +1,11 @@
 """
 polyedge - Polymarket Edge Scanner
 
-Modos:
-    python main.py                    # Scanner general continuo
+Uso:
+    python main.py                    # Scanner continuo
     python main.py --once             # Un solo scan y salir
     python main.py --interval 10      # Override del intervalo en segundos
-    python main.py --mode btc         # Solo monitor BTC Up or Down diario (v4 — HAR-RV)
-    python main.py --mode btcv5       # Solo monitor BTC v5 (Deribit IV + calibración + microestructura)
-    python main.py --mode both        # Scanner general + BTC monitor v4 en paralelo
-    python main.py --mode bothv5      # Scanner general + BTC monitor v5 en paralelo
+    python main.py --dry-run          # Forzar modo simulacion
 """
 import argparse
 import time
@@ -38,15 +35,6 @@ def main():
     parser = argparse.ArgumentParser(description="polyedge - Polymarket Edge Scanner")
     parser.add_argument("--once",     action="store_true", help="Ejecutar un solo scan y salir")
     parser.add_argument("--interval", type=int, default=None, help="Intervalo en segundos entre scans")
-    parser.add_argument(
-        "--mode",
-        choices=["scanner", "btc", "btcv5", "both", "bothv5"],
-        default="scanner",
-        help=(
-            "Modo de operacion: scanner (default), btc (BTC v4 HAR-RV), "
-            "btcv5 (BTC v5 Deribit ensemble), both (scanner+v4), bothv5 (scanner+v5)"
-        ),
-    )
     parser.add_argument("--dry-run", action="store_true", help="Forzar modo simulacion (override DRY_RUN=false en .env)")
     args = parser.parse_args()
 
@@ -59,26 +47,18 @@ def main():
     interval = args.interval or int(os.getenv("SCAN_INTERVAL_SECONDS", scanner_cfg.get("interval_seconds", 30)))
     min_edge = float(os.getenv("MIN_EDGE_THRESHOLD", signals_cfg.get("min_edge_threshold", 0.03)))
 
-    mode_label = {
-        "scanner": "Scanner General",
-        "btc":     "BTC Up/Down Monitor v4",
-        "btcv5":   "BTC Up/Down Monitor v5 (Deribit ensemble)",
-        "both":    "Scanner General + BTC Monitor v4",
-        "bothv5":  "Scanner General + BTC Monitor v5",
-    }[args.mode]
-
     console.print(Panel.fit(
         "[bold cyan]polyedge[/bold cyan] [dim]— Polymarket Edge Scanner[/dim]\n"
-        f"[dim]Modo: {mode_label} | Interval: {interval}s | Min edge: {min_edge:.0%}[/dim]",
+        f"[dim]Interval: {interval}s | Min edge: {min_edge:.0%}[/dim]",
         border_style="cyan"
     ))
 
-    # Credenciales compartidas
+    # Credenciales
     proxy               = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or None
     odds_api_key        = os.getenv("ODDS_API_KEY") or None
     rapidapi_key        = os.getenv("RAPIDAPI_KEY") or None
-    finnhub_api_key       = os.getenv("FINNHUB_API_KEY") or None
-    metaculus_api_token   = os.getenv("METACULUS_API_TOKEN") or None
+    finnhub_api_key     = os.getenv("FINNHUB_API_KEY") or None
+    metaculus_api_token  = os.getenv("METACULUS_API_TOKEN") or None
     telegram_token      = os.getenv("TELEGRAM_BOT_TOKEN") or None
     telegram_chat_id    = os.getenv("TELEGRAM_CHAT_ID") or None
     clob_private_key    = os.getenv("POLYGON_PRIVATE_KEY") or None
@@ -91,8 +71,8 @@ def main():
     bankroll_usd        = float(os.getenv("BANKROLL_USD", "100"))
     max_position_usd    = float(os.getenv("MAX_POSITION_USD", "20"))
     max_daily_loss_usd  = float(os.getenv("MAX_DAILY_LOSS_USD", "10"))
-    min_edge_to_trade       = float(os.getenv("MIN_EDGE_TO_TRADE", "0.06"))
-    max_days_to_resolution  = int(os.getenv("MAX_DAYS_TO_RESOLUTION", "7"))
+    min_edge_to_trade   = float(os.getenv("MIN_EDGE_TO_TRADE", "0.06"))
+    max_days_to_resolution = int(os.getenv("MAX_DAYS_TO_RESOLUTION", "7"))
 
     running = True
     def shutdown(sig, frame):
@@ -103,7 +83,6 @@ def main():
     signal.signal(signal.SIGTERM, shutdown)
 
     # ── Notifier (Telegram) ────────────────────────────────────────────────────
-    # Instancia única compartida entre scanner, BTC monitor y P&L tracker.
     notifier = None
     try:
         from src.notifications.telegram import TelegramNotifier
@@ -116,10 +95,7 @@ def main():
     except ImportError:
         pass
 
-    # ── Executor (TradeExecutor compartido) ────────────────────────────────────
-    # UN SOLO executor para todos los modos. Así _executed_ids es compartido:
-    # un trade en el BTC monitor bloquea ese conditionId en el scanner y viceversa.
-    # También persiste _executed_ids y _daily_loss a disco para sobrevivir reinicios.
+    # ── Executor ───────────────────────────────────────────────────────────────
     shared_executor = None
     try:
         from src.execution.trade_executor import TradeExecutor
@@ -139,32 +115,9 @@ def main():
                 notifier=notifier,
             )
             mode_str = "DRY RUN" if dry_run else "LIVE"
-            logger.info(f"[EXECUTOR] Instancia compartida creada [{mode_str}]")
+            logger.info(f"[EXECUTOR] Instancia creada [{mode_str}]")
     except ImportError:
         pass
-
-    # ── BTC Monitor ────────────────────────────────────────────────────────────
-    btc_monitor = None
-    if args.mode in ("btc", "both", "btcv5", "bothv5"):
-        if args.mode in ("btcv5", "bothv5"):
-            from src.monitors.btc_arb_monitor_v5 import BtcArbMonitorV5 as _BtcCls
-            min_edge_btc = float(os.getenv("MIN_EDGE_BTC", "0.10"))
-            version_tag  = "v5"
-        else:
-            from src.monitors.btc_arb_monitor import BtcArbMonitor as _BtcCls
-            min_edge_btc = float(os.getenv("MIN_EDGE_BTC", "0.09"))
-            version_tag  = "v4"
-
-        btc_monitor = _BtcCls(
-            executor=shared_executor,   # executor compartido — bloquea cross-signal
-            notifier=notifier,
-            min_edge=min_edge_btc,
-            dry_run=dry_run,
-            bankroll_usd=bankroll_usd,
-        )
-        btc_monitor.start()
-        mode_str = "DRY RUN" if dry_run else "LIVE"
-        logger.info(f"[BTC ARB {version_tag}] Monitor iniciado [{mode_str}]")
 
     # ── P&L Tracker ────────────────────────────────────────────────────────────
     pnl_tracker = None
@@ -176,62 +129,51 @@ def main():
     except Exception as e:
         logger.warning(f"[PNL] Tracker no disponible: {e}")
 
-    # ── Scanner General ────────────────────────────────────────────────────────
-    if args.mode in ("scanner", "both", "bothv5"):
-        client = GammaApiClient(
-            timeout=api_cfg.get("request_timeout", 15),
-            max_retries=api_cfg.get("max_retries", 3),
-            proxy=proxy,
-        )
-        scanner = MarketScanner(
-            client=client,
-            fee_rate=float(os.getenv("FEE_RATE", signals_cfg.get("fee_rate", 0.02))),
-            min_edge=min_edge,
-            min_liquidity_usd=float(os.getenv("MIN_LIQUIDITY_USD", scanner_cfg.get("min_liquidity_usd", 500))),
-            max_markets=scanner_cfg.get("max_markets", 5000),
-            opportunities_csv=logging_cfg.get("opportunities_csv", "data/opportunities.csv"),
-            odds_api_key=odds_api_key,
-            rapidapi_key=rapidapi_key,
-            finnhub_api_key=finnhub_api_key,
-            metaculus_api_token=metaculus_api_token,
-            telegram_token=telegram_token,
-            telegram_chat_id=telegram_chat_id,
-            telegram_min_edge=float(os.getenv("TELEGRAM_MIN_EDGE", "0.05")),
-            proxy=proxy,
-            alchemy_api_key=alchemy_api_key,
-            executor=shared_executor,   # executor compartido — no crea uno propio
-        )
+    # ── Scanner ────────────────────────────────────────────────────────────────
+    client = GammaApiClient(
+        timeout=api_cfg.get("request_timeout", 15),
+        max_retries=api_cfg.get("max_retries", 3),
+        proxy=proxy,
+    )
+    scanner = MarketScanner(
+        client=client,
+        fee_rate=float(os.getenv("FEE_RATE", signals_cfg.get("fee_rate", 0.02))),
+        min_edge=min_edge,
+        min_liquidity_usd=float(os.getenv("MIN_LIQUIDITY_USD", scanner_cfg.get("min_liquidity_usd", 500))),
+        max_markets=scanner_cfg.get("max_markets", 5000),
+        opportunities_csv=logging_cfg.get("opportunities_csv", "data/opportunities.csv"),
+        odds_api_key=odds_api_key,
+        rapidapi_key=rapidapi_key,
+        finnhub_api_key=finnhub_api_key,
+        metaculus_api_token=metaculus_api_token,
+        telegram_token=telegram_token,
+        telegram_chat_id=telegram_chat_id,
+        telegram_min_edge=float(os.getenv("TELEGRAM_MIN_EDGE", "0.05")),
+        proxy=proxy,
+        alchemy_api_key=alchemy_api_key,
+        executor=shared_executor,
+    )
 
-        scan_num = 0
-        while running:
-            scan_num += 1
-            scanner.scan_once(scan_num=scan_num)
+    scan_num = 0
+    while running:
+        scan_num += 1
+        scanner.scan_once(scan_num=scan_num)
 
-            # Actualizar P&L cada 10 scans e imprimir resumen
-            if pnl_tracker and scan_num % 10 == 0:
-                try:
-                    pnl_tracker.update()
-                    pnl_tracker.print_summary()
-                except Exception as e:
-                    logger.debug(f"[PNL] update error: {e}")
+        if pnl_tracker and scan_num % 10 == 0:
+            try:
+                pnl_tracker.update()
+                pnl_tracker.print_summary()
+            except Exception as e:
+                logger.debug(f"[PNL] update error: {e}")
 
-            if args.once:
-                break
+        if args.once:
+            break
 
-            if running:
-                for _ in range(interval):
-                    if not running:
-                        break
-                    time.sleep(1)
-
-    elif args.mode in ("btc", "btcv5"):
-        # Solo BTC monitor — el main thread duerme mientras el monitor corre en background
-        logger.info(f"[BTC ARB] Corriendo en modo BTC-only ({args.mode}). Ctrl+C para detener.")
-        while running:
-            time.sleep(1)
-
-    if btc_monitor:
-        btc_monitor.stop()
+        if running:
+            for _ in range(interval):
+                if not running:
+                    break
+                time.sleep(1)
 
     console.print("[dim]polyedge stopped.[/dim]")
 

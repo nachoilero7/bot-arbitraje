@@ -29,17 +29,21 @@ from src.utils.logger import get_logger
 logger = get_logger(__name__)
 
 # Umbrales basados en SSRN 5910522
-LOW_PROB_THRESHOLD  = 0.10   # Debajo de esto: mercado subestima el evento
-HIGH_PROB_THRESHOLD = 0.80   # Arriba de esto: mercado sobrevalua el evento
+LOW_PROB_THRESHOLD  = 0.15   # Ampliado: debajo de 15% el sesgo sigue siendo significativo
+HIGH_PROB_THRESHOLD = 0.85   # Ampliado: arriba de 85% hay overpricing de favoritos
 
-# Ajustes empiricos: eventos <10% ocurren 14% del tiempo → factor 1.40
-LOW_PROB_ADJUSTMENT  = 1.40  # P_real ≈ P_market × 1.40 para eventos raros
-HIGH_PROB_ADJUSTMENT = 0.97  # P_real ≈ P_market × 0.97 para favoritos
+# Ajustes empiricos (SSRN 5910522, 124M trades):
+# - Eventos <10%: ocurren 14% del tiempo → factor 1.40
+# - Eventos 10-15%: sesgo menor pero aún significativo → factor 1.20
+# - Eventos >85%: overpricing ~3-5% → factor 0.96
+LOW_PROB_ADJUSTMENT      = 1.40  # P_real ≈ P_market × 1.40 para YES < 10%
+LOW_PROB_ADJUSTMENT_MILD = 1.20  # P_real ≈ P_market × 1.20 para YES 10-15%
+HIGH_PROB_ADJUSTMENT     = 0.96  # P_real ≈ P_market × 0.96 para favoritos (antes 0.97)
 
 # Filtros minimos — el sesgo existe pero fees lo erosionan en mercados iliquidos
-MIN_LIQUIDITY = 1_000   # USD — necesitamos poder ejecutar
-MIN_VOLUME_24H = 200    # USD — mercado activo
-MAX_SPREAD = 0.20       # no entrar en mercados con spread demasiado amplio
+MIN_LIQUIDITY = 2_000   # USD — necesitamos liquidez real para FAK fills
+MIN_VOLUME_24H = 500    # USD — mercado activo
+MAX_SPREAD = 0.15       # no entrar en mercados con spread demasiado amplio
 
 # Per-category calibration adjustments based on empirical research:
 # Leigh & Wolfers (2006) - political markets; Barber et al. (2022) - retail attention
@@ -121,9 +125,14 @@ class CalibrationBiasSignal(BaseSignal):
 
                 yes_adj, no_adj = self._get_category_adjustment(market)
 
-                # ── Caso LOW: YES < 10% → mercado subestima, comprar YES ──
+                # ── Caso LOW: YES < 15% → mercado subestima, comprar YES ──
+                # SSRN 5910522: sesgo más fuerte bajo 10%, moderado entre 10-15%
                 if yes_price < LOW_PROB_THRESHOLD:
-                    true_yes      = min(yes_price * LOW_PROB_ADJUSTMENT, LOW_PROB_THRESHOLD * 1.5)
+                    if yes_price < 0.10:
+                        adj_factor = LOW_PROB_ADJUSTMENT       # 1.40x para < 10%
+                    else:
+                        adj_factor = LOW_PROB_ADJUSTMENT_MILD  # 1.20x para 10-15%
+                    true_yes      = min(yes_price * adj_factor, LOW_PROB_THRESHOLD * 1.5)
                     edge          = true_yes - yes_price - self.fee_rate
                     adjusted_edge = edge + yes_adj
 

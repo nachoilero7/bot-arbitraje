@@ -16,6 +16,7 @@ import csv
 import json
 import os
 import threading
+import time
 from datetime import datetime, date
 from dataclasses import dataclass
 
@@ -43,11 +44,17 @@ CLOB_HOST        = "https://clob.polymarket.com"
 SIGNAL_MAX_DAYS: dict[str, int] = {
     "RESOLUTION_LAG":   3,   # resultado ya determinado, solo lag de precio
     "SPREAD_CAPTURE":   3,   # market making, rotacion rapida de capital
-    "PRICE_DRIFT":      5,   # momentum se diluye con el tiempo
     "OVERPRICED_NO":    5,   # condicion transitoria de mercado
-    "CALIBRATION_BIAS": 10,  # sesgo sistematico, valido a mediano plazo (SSRN 5910522)
+    "CALIBRATION_BIAS": 14,  # sesgo sistematico, valido a mediano plazo (SSRN 5910522)
     "PARITY":           7,   # arb puro pero preferir mercados cercanos
-    "MISPRICED_CORR":   7,   # violaciones logicas / exclusion mutua
+    "MISPRICED_CORR":   10,  # violaciones logicas / exclusion mutua — Masters-style arbs
+}
+
+# Edge mínimo por señal — override del global MIN_EDGE_TO_TRADE.
+# CALIBRATION_BIAS tiene edges chicos (1-3%) pero estadísticamente significativos en 124M trades.
+SIGNAL_MIN_EDGE: dict[str, float] = {
+    "CALIBRATION_BIAS": 0.01,  # 1% — el paper documenta 3-5% de mispricing, fees son 2%
+    "MISPRICED_CORR":   0.03,  # 3% — mutex arbs
 }
 
 
@@ -102,11 +109,16 @@ class TradeExecutor:
         self._loss_date: date   = date.today()
         self._trades_today: int = 0
         self._executed_ids: set = set()  # evitar duplicados: bloquea condition_id completo (cualquier lado)
+        self._executed_questions: list = []   # [(question, end_date, side), ...] — detecta mercados correlados
+        self._failed_cooldown: dict = {}   # condition_id → timestamp del último FAK rejection
         self._lock = threading.Lock()    # serializa maybe_execute entre threads
         self._state_file = "data/executor_state.json"
+        self._signal_calibration: dict = {}   # signal_name → multiplier (1.0 = neutral)
+        self._calibration_trades_count = 0    # trades cuando se computó por última vez
 
         # Cargar estado persistido del dia actual (sobrevive reinicios del bot)
         self._load_state()
+        self._refresh_calibration()
 
         # Inicializar cliente CLOB
         creds = ApiCreds(
@@ -157,12 +169,18 @@ class TradeExecutor:
             return self._maybe_execute_locked(opportunity)
 
     def _maybe_execute_locked(self, opportunity: Opportunity) -> TradeResult | None:
-        # Reset diario si cambio el dia — limpiar estado persistido tambien
+        # Reset diario: solo resetea contadores diarios (loss y trades_today).
+        # _executed_ids y _executed_questions NO se limpian por tiempo — solo cuando
+        # la posicion resuelve (won/lost). Limpiarlos por día causa self-hedging:
+        # si hoy compramos YES y mañana el reset borra el id, pasado mañana podemos
+        # comprar NO en el mismo mercado.
         if date.today() != self._loss_date:
             self._daily_loss   = 0.0
             self._loss_date    = date.today()
             self._trades_today = 0
-            self._executed_ids.clear()
+            self._failed_cooldown.clear()
+            # Podar executed_ids: sacar los que ya resolvieron (won/lost) segun pnl_state
+            self._prune_resolved_ids()
             self._save_state()
 
         # Filtros de seguridad
@@ -202,7 +220,15 @@ class TradeExecutor:
             logger.debug(f"[EXECUTOR] Skip {opportunity.condition_id[:12]} — Kelly size too small: ${kelly.position_usd:.2f}")
             return None
 
-        price    = opportunity.market_price
+        # Usar best_ask si está disponible y es mayor que el mid — asegura que cruzamos
+        # el spread para obtener fills reales en órdenes FAK (Fill And Kill).
+        # Si el scanner no tiene best_ask (0), usa market_price.
+        best_ask = getattr(opportunity, "best_ask", 0) or 0
+        if best_ask > opportunity.market_price:
+            # Bump pequeño por encima del ask para capturar el nivel
+            price = round(min(best_ask + 0.002, 0.99), 4)
+        else:
+            price = round(opportunity.market_price, 4)
         size_usd = kelly.position_usd
 
         # Para parity arb (YES+NO): ambos tokens se compran en cantidades iguales.
@@ -232,11 +258,21 @@ class TradeExecutor:
             result = self._execute_trade(opportunity, price, size_tokens, size_usd)
 
         if result:
-            self._save_trade(result)
-            self._trades_today += 1
-            # Marcar como ejecutado para no repetir — persistir en disco para sobrevivir reinicios
-            self._executed_ids.add(opportunity.condition_id)
-            self._save_state()
+            # Solo guardar en CSV los fills exitosos — no registrar FAK rejections
+            if result.success or result.dry_run:
+                self._save_trade(result)
+            # Solo marcar como ejecutado si el fill fue exitoso (o es simulación).
+            # Una orden FAK rechazada por falta de liquidez NO debe bloquear el mercado,
+            # pero sí activar cooldown para no spammear.
+            if not result.success and not result.dry_run:
+                self._failed_cooldown[opportunity.condition_id] = time.time()
+            if result.success or result.dry_run:
+                self._trades_today += 1
+                self._executed_ids.add(opportunity.condition_id)
+                self._executed_questions.append(
+                    (opportunity.question, getattr(opportunity, "end_date", ""), opportunity.side)
+                )
+                self._save_state()
             # Notificar por Telegram cuando el trade es exitoso
             if result.success and self.notifier:
                 try:
@@ -281,7 +317,16 @@ class TradeExecutor:
 
     def _passes_filters(self, opp: Opportunity) -> bool:
         # Edge minimo para ejecutar (mas alto que para detectar)
-        if opp.edge < self.min_edge_to_trade:
+        effective_min = self._adjusted_min_edge(opp)
+        if opp.edge < effective_min:
+            signal_name = opp.signal_type.value if hasattr(opp.signal_type, "value") else str(opp.signal_type)
+            logger.debug(
+                f"[EXECUTOR] Skip {opp.condition_id[:12]} — edge {opp.edge:.4f} < "
+                f"threshold {effective_min:.4f} "
+                f"(consensus={getattr(opp,'consensus_count',1)} "
+                f"trend={getattr(opp,'price_trend',0.0):+.3f} "
+                f"cal={self._signal_calibration.get(signal_name, 1.0):.2f})"
+            )
             return False
 
         # Horizonte temporal por tipo de señal
@@ -309,20 +354,34 @@ class TradeExecutor:
             return False
 
         # Liquidez minima
-        if opp.liquidity_usd < 500:
+        if opp.liquidity_usd < 2000:
             return False
 
-        # CLOB rechaza precios fuera del rango [0.001, 0.999]
-        if opp.market_price < 0.001:
-            logger.debug(f"[EXECUTOR] Skip {opp.condition_id[:12]} — precio {opp.market_price:.5f} bajo el minimo CLOB (0.001)")
+        # Hard price floor/ceiling — no operar en extremos sin liquidez real
+        # Rango principal: $0.05-$0.95. Para CALIBRATION_BIAS LOW case, permitir hasta $0.03
+        # (el paper SSRN documenta edge en YES < 10%, necesitamos bajar a 3 centavos).
+        signal_name = opp.signal_type.value if hasattr(opp.signal_type, "value") else str(opp.signal_type)
+        price_floor = 0.03 if signal_name == "CALIBRATION_BIAS" else 0.05
+        if opp.market_price < price_floor:
+            logger.debug(f"[EXECUTOR] Skip {opp.condition_id[:12]} — precio {opp.market_price:.3f} bajo piso ${price_floor}")
             return False
-        if opp.market_price >= 0.99:
-            logger.debug(f"[EXECUTOR] Skip {opp.condition_id[:12]} — precio {opp.market_price:.4f} demasiado alto (mercado resuelto)")
+        if opp.market_price > 0.95:
+            logger.debug(f"[EXECUTOR] Skip {opp.condition_id[:12]} — precio {opp.market_price:.3f} sobre techo $0.95")
+            return False
+
+        # Cooldown después de FAK rejection — no spammear el mismo mercado
+        cooldown_ts = self._failed_cooldown.get(opp.condition_id, 0)
+        if time.time() - cooldown_ts < 300:  # 5 minutos de cooldown
             return False
 
         # No operar en el mismo mercado dos veces (ningún lado) — evita hedgearse a sí mismo
         if opp.condition_id in self._executed_ids:
             logger.debug(f"[EXECUTOR] Skip {opp.condition_id[:12]} — mercado ya operado hoy (bloqueo ambos lados)")
+            return False
+
+        # Mercados correlados: mismo evento real con condition_id distinto (ej: candidatos al mismo cargo)
+        if self._is_correlated_market(opp):
+            logger.debug(f"[EXECUTOR] Skip {opp.condition_id[:12]} — mercado correlado ya operado")
             return False
 
         # Freno de perdidas diarias
@@ -331,6 +390,74 @@ class TradeExecutor:
             return False
 
         return True
+
+    def _is_correlated_market(self, opp: Opportunity) -> bool:
+        """
+        Detecta mercados mutuamente exclusivos que pertenecen al mismo evento real.
+
+        Distingue self-hedge (malo) de mutex-arb (bueno):
+          - Orban YES + Magyar YES  → SELF-HEDGE: solo uno puede ganar → bloquear
+          - Scheffler NO + Rory NO  → MUTEX ARB: suma YES > 1 → ambos NOs ganan con alta prob → permitir
+          - Orban YES + Magyar NO   → Posiciones opuestas en mutex → bloquear (dudoso)
+
+        Regla: solo bloquear cuando la nueva trade es YES y ya hay un YES correlado,
+        o cuando la nueva es YES y hay un NO correlado (y viceversa).
+        Permite múltiples NO en el mismo grupo mutex (el caso del Masters con 79 candidatos).
+
+        Solo se aplica a señales de correlación (MISPRICED_CORR, COMBINATORIAL_ARB, CALIBRATION_BIAS).
+        """
+        signal_name = opp.signal_type.value if hasattr(opp.signal_type, "value") else str(opp.signal_type)
+        if signal_name not in ("MISPRICED_CORR", "COMBINATORIAL_ARB", "CALIBRATION_BIAS"):
+            return False
+
+        new_side = (opp.side or "").upper()
+        end_date_new = (getattr(opp, "end_date", "") or "")[:10]  # solo YYYY-MM-DD
+        stop = {"will", "the", "be", "a", "an", "of", "in", "on", "at", "to", "by",
+                "is", "for", "or", "and", "not", "no", "?", "next"}
+        words_new = set(opp.question.lower().split()) - stop
+
+        for entry in self._executed_questions:
+            # Soporte backward-compatible: tuplas viejas (q, date) y nuevas (q, date, side)
+            if len(entry) >= 3:
+                prev_q, prev_date, prev_side = entry[0], entry[1], (entry[2] or "").upper()
+            else:
+                prev_q, prev_date = entry[0], entry[1]
+                prev_side = ""
+
+            # Misma ventana temporal (±7 días)
+            if end_date_new and prev_date:
+                try:
+                    from datetime import date as _date
+                    d1 = _date.fromisoformat(end_date_new)
+                    d2 = _date.fromisoformat(prev_date[:10])
+                    if abs((d1 - d2).days) > 7:
+                        continue
+                except Exception:
+                    pass
+
+            words_prev = set(prev_q.lower().split()) - stop
+            if not words_new or not words_prev:
+                continue
+
+            intersection = words_new & words_prev
+            union        = words_new | words_prev
+            jaccard = len(intersection) / len(union) if union else 0.0
+
+            if jaccard < 0.45:
+                continue
+
+            # Ambos NO en grupo mutex → arb legítimo, permitir
+            if new_side == "NO" and prev_side == "NO":
+                continue
+
+            # En cualquier otro caso (YES+YES, YES+NO, NO+YES, o sin side previo) → bloquear
+            logger.debug(
+                f"[EXECUTOR] Mercado correlado (Jaccard={jaccard:.2f}, "
+                f"sides={prev_side}/{new_side}): '{opp.question[:40]}' ~ '{prev_q[:40]}'"
+            )
+            return True
+
+        return False
 
     def _simulate_trade(self, opp: Opportunity, price: float, size: float, size_usd: float) -> TradeResult:
         logger.info(
@@ -359,19 +486,22 @@ class TradeExecutor:
                 side="BUY",
             )
             signed = self.client.create_order(order_args)
-            resp   = self.client.post_order(signed, OrderType.GTC)
+            resp   = self.client.post_order(signed, OrderType.FAK)
 
             order_id = resp.get("orderID", "") or resp.get("id", "")
             success  = resp.get("success", False) or bool(order_id)
 
             if success:
                 logger.info(
-                    f"[TRADE] {opp.signal_type.value} | {opp.question[:50]} | "
+                    f"[TRADE FILLED] {opp.signal_type.value} | {opp.question[:50]} | "
                     f"side={opp.side} price={price:.3f} size=${size_usd:.2f} "
                     f"edge={opp.edge:.4f} order_id={order_id}"
                 )
             else:
-                logger.error(f"[TRADE FAILED] {resp}")
+                logger.warning(
+                    f"[TRADE NO FILL] {opp.question[:50]} | "
+                    f"side={opp.side} price={price:.3f} — sin liquidez a ese precio"
+                )
 
             return TradeResult(
                 opportunity=opp,
@@ -425,7 +555,7 @@ class TradeExecutor:
         try:
             yes_args = OrderArgs(token_id=opp.token_id,   price=price_yes,    size=size, side="BUY")
             signed   = self.client.create_order(yes_args)
-            resp     = self.client.post_order(signed, OrderType.GTC)
+            resp     = self.client.post_order(signed, OrderType.FAK)
             order_id_yes = resp.get("orderID", "") or resp.get("id", "")
             if not (resp.get("success", False) or order_id_yes):
                 errors.append(f"YES failed: {resp}")
@@ -438,7 +568,7 @@ class TradeExecutor:
         try:
             no_args = OrderArgs(token_id=opp.token_id_b, price=opp.price_b, size=size, side="BUY")
             signed  = self.client.create_order(no_args)
-            resp    = self.client.post_order(signed, OrderType.GTC)
+            resp    = self.client.post_order(signed, OrderType.FAK)
             order_id_no = resp.get("orderID", "") or resp.get("id", "")
             if not (resp.get("success", False) or order_id_no):
                 errors.append(f"NO failed: {resp}")
@@ -472,29 +602,186 @@ class TradeExecutor:
 
     def _load_state(self):
         """
-        Restaura executed_ids y daily_loss del dia actual al iniciar.
-        Si el archivo es de otro dia, lo ignora (reset automatico).
-        Evita que reinicios del bot repitan trades ya ejecutados hoy
-        o que se pierda el conteo de perdidas diarias.
+        Restaura el estado al iniciar:
+        - executed_ids / executed_questions: SIEMPRE se cargan (independiente del día),
+          porque las posiciones abiertas duran hasta que el mercado resuelve, no 1 día.
+          Se podan los que ya resolvieron via _prune_resolved_ids().
+        - daily_loss / trades_today: solo si es del día actual (son contadores diarios).
         """
         if not os.path.exists(self._state_file):
             return
         try:
             with open(self._state_file, encoding="utf-8") as f:
                 data = json.load(f)
-            saved_date = date.fromisoformat(data.get("date", ""))
-            if saved_date != date.today():
-                return   # datos de otro dia, ignorar
+            # Cargar executed_ids SIEMPRE — evita self-hedge cross-día
             self._executed_ids = set(data.get("executed_ids", []))
-            self._daily_loss   = float(data.get("daily_loss", 0.0))
+            self._executed_questions = data.get("executed_questions", [])
+            # Podar condition_ids que ya resolvieron
+            self._prune_resolved_ids()
+            # Contadores diarios: solo si es del día actual
+            saved_date_str = data.get("date", "")
+            try:
+                saved_date = date.fromisoformat(saved_date_str)
+                if saved_date == date.today():
+                    self._daily_loss = float(data.get("daily_loss", 0.0))
+            except (ValueError, TypeError):
+                pass
             n = len(self._executed_ids)
             if n:
                 logger.info(
-                    f"[EXECUTOR] Estado restaurado: {n} mercados ya ejecutados hoy, "
+                    f"[EXECUTOR] Estado restaurado: {n} mercados con posicion activa, "
                     f"daily_loss=${self._daily_loss:.2f}"
                 )
         except Exception as e:
             logger.debug(f"[EXECUTOR] No se pudo cargar estado: {e}")
+
+    def _prune_resolved_ids(self):
+        """
+        Saca de executed_ids y executed_questions los condition_ids cuyos mercados
+        ya resolvieron (status won/lost en pnl_state.json). Esto permite reusar el
+        capital de posiciones cerradas sin riesgo de self-hedge en las abiertas.
+        """
+        pnl_path = "data/pnl_state.json"
+        if not os.path.exists(pnl_path):
+            return
+        try:
+            with open(pnl_path, encoding="utf-8") as f:
+                pnl_state = json.load(f)
+            resolved = {
+                cid for cid, s in pnl_state.items()
+                if s.get("status") in ("won", "lost")
+            }
+            before = len(self._executed_ids)
+            self._executed_ids = {cid for cid in self._executed_ids if cid not in resolved}
+            # executed_questions no tiene el cid pero no importa — los datos viejos
+            # se podan por la ventana ±7d en _is_correlated_market
+            after = len(self._executed_ids)
+            if before != after:
+                logger.info(f"[EXECUTOR] Podados {before - after} mercados resueltos de executed_ids")
+        except Exception as e:
+            logger.debug(f"[EXECUTOR] No se pudo podar executed_ids: {e}")
+
+    def _refresh_calibration(self):
+        """
+        Computa factores de calibración por tipo de señal a partir del historial
+        de trades reales (trades.csv + pnl_state.json).
+
+        Factor de calibración:
+          - 1.0  = neutral (sin historial o win rate = 50%)
+          - <1.0 = señal confiable (win rate > 50%) → umbral más fácil de alcanzar
+          - >1.0 = señal poco confiable (win rate < 50%) → umbral más exigente
+
+        Fórmula: multiplier = 1.0 - (win_rate - 0.5) * 0.80
+        Cap: [0.70, 1.40]
+        Mínimo 8 trades resueltos por señal para aplicar calibración.
+        """
+        cal = {}
+        try:
+            # Leer trades
+            if not os.path.exists(self.trades_csv):
+                self._signal_calibration = cal
+                return
+
+            import csv as _csv
+            trades_by_signal: dict = {}
+            with open(self.trades_csv, "r", encoding="utf-8") as f:
+                for row in _csv.DictReader(f):
+                    if row.get("dry_run", "True").lower() == "true":
+                        continue
+                    if row.get("success", "False").lower() != "true":
+                        continue
+                    # Filtrar trades fantasma: ordenes GTC a precios extremos que nunca
+                    # se llenaron (era el bug pre-FOK). Solo contar trades a precios donde
+                    # realmente hay liquidez ejecutable.
+                    try:
+                        price = float(row.get("price", "0"))
+                        if price < 0.05 or price > 0.95:
+                            continue
+                    except (ValueError, TypeError):
+                        continue
+                    cid = row.get("condition_id", "")
+                    sig = row.get("signal_type", "UNKNOWN")
+                    if cid and sig:
+                        trades_by_signal.setdefault(sig, []).append(cid)
+
+            # Leer estado de resolución
+            pnl_state_path = "data/pnl_state.json"
+            if not os.path.exists(pnl_state_path):
+                self._signal_calibration = cal
+                return
+
+            with open(pnl_state_path, "r", encoding="utf-8") as f:
+                pnl_state = json.load(f)
+
+            # Calcular win rate por señal
+            for sig, cids in trades_by_signal.items():
+                wins = losses = 0
+                seen = set()
+                for cid in cids:
+                    if cid in seen:
+                        continue
+                    seen.add(cid)
+                    status = pnl_state.get(cid, {}).get("status", "open")
+                    if status == "won":
+                        wins += 1
+                    elif status == "lost":
+                        losses += 1
+
+                resolved = wins + losses
+                if resolved < 8:
+                    continue   # historial insuficiente
+
+                win_rate = wins / resolved
+                multiplier = 1.0 - (win_rate - 0.5) * 0.80
+                multiplier = max(0.70, min(1.40, multiplier))
+                cal[sig] = round(multiplier, 3)
+                logger.info(
+                    f"[CALIBRATION] {sig}: win_rate={win_rate:.0%} "
+                    f"({wins}W/{losses}L) → multiplier={multiplier:.3f}"
+                )
+
+        except Exception as e:
+            logger.debug(f"[CALIBRATION] Error calculando calibración: {e}")
+
+        self._signal_calibration = cal
+
+    def _adjusted_min_edge(self, opp: Opportunity) -> float:
+        """
+        Calcula el edge mínimo requerido para ejecutar, ajustado por:
+        1. Consenso multi-señal (más señales acordando → umbral más bajo)
+        2. Trayectoria de precio (precio moviéndose en contra → umbral más alto)
+        3. Calibración histórica de la señal (win rate real → ajusta umbral)
+
+        Retorna el threshold efectivo a comparar contra opp.edge.
+        """
+        signal_name = opp.signal_type.value if hasattr(opp.signal_type, "value") else str(opp.signal_type)
+        base = SIGNAL_MIN_EDGE.get(signal_name, self.min_edge_to_trade)
+
+        # ── 1. Bonus por consenso multi-señal ────────────────────────────────
+        consensus = getattr(opp, "consensus_count", 1)
+        if consensus >= 3:
+            base *= 0.75    # 3+ señales acordando: umbral 25% más fácil
+        elif consensus >= 2:
+            base *= 0.875   # 2 señales: umbral 12.5% más fácil
+
+        # ── 2. Penalización por precio en contra ──────────────────────────────
+        trend = getattr(opp, "price_trend", 0.0)
+        if trend < -0.015:
+            base *= 1.25    # precio cayendo fuerte en nuestra contra: +25% de exigencia
+        elif trend < -0.005:
+            base *= 1.10    # tendencia leve en contra: +10%
+
+        # ── 3. Calibración histórica de la señal ─────────────────────────────
+        # Refrescar calibración cada 10 trades nuevos
+        if self._trades_today - self._calibration_trades_count >= 10:
+            self._refresh_calibration()
+            self._calibration_trades_count = self._trades_today
+
+        signal_name = opp.signal_type.value if hasattr(opp.signal_type, "value") else str(opp.signal_type)
+        cal_multiplier = self._signal_calibration.get(signal_name, 1.0)
+        base *= cal_multiplier
+
+        return base
 
     def _save_state(self):
         """Persiste executed_ids y daily_loss a disco."""
@@ -502,9 +789,10 @@ class TradeExecutor:
         try:
             with open(self._state_file, "w", encoding="utf-8") as f:
                 json.dump({
-                    "date":         date.today().isoformat(),
-                    "executed_ids": list(self._executed_ids),
-                    "daily_loss":   round(self._daily_loss, 4),
+                    "date":               date.today().isoformat(),
+                    "executed_ids":       list(self._executed_ids),
+                    "daily_loss":         round(self._daily_loss, 4),
+                    "executed_questions": self._executed_questions,
                 }, f)
         except Exception as e:
             logger.debug(f"[EXECUTOR] No se pudo guardar estado: {e}")

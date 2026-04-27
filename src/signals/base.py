@@ -53,6 +53,10 @@ class Opportunity:
     notes: str = ""
     end_date: str = ""   # endDate del mercado (ISO) — para filtro de horizonte en executor
 
+    # Contexto adicional para decisión de ejecución
+    consensus_count: int = 1      # señales independientes que confirman este trade (≥2 = mayor confianza)
+    price_trend: float = 0.0      # cambio reciente del precio hacia nuestro fair_value (+ = buena señal)
+
     def is_actionable(self, min_edge: float = 0.03) -> bool:
         return self.edge >= min_edge and self.market_price > 0
 

@@ -107,8 +107,11 @@ class PnLTracker:
     # ── Internal ───────────────────────────────────────────────────────────────
 
     def _fetch_batch(self, condition_ids: list[str]):
-        # Gamma API solo acepta condition_ids de a uno — requests individuales
+        # Gamma API solo acepta condition_ids de a uno — requests individuales.
+        # Default de Gamma es solo mercados activos; mercados cerrados requieren closed=true.
+        # Hacemos 2 queries: primero activos, luego cerrados para los que no respondieron.
         markets = []
+        found_cids = set()
         for cid in condition_ids:
             try:
                 resp = requests.get(
@@ -121,8 +124,26 @@ class PnLTracker:
                 data = resp.json()
                 if data:
                     markets.extend(data)
+                    found_cids.add(cid)
             except Exception as e:
                 logger.debug(f"[PNL] Error fetching {cid[:12]}: {e}")
+
+        # Los que no aparecieron estan cerrados — consultar con closed=true
+        missing = [c for c in condition_ids if c not in found_cids]
+        for cid in missing:
+            try:
+                resp = requests.get(
+                    f"{GAMMA_API}/markets",
+                    params={"condition_ids": cid, "closed": "true"},
+                    proxies=self._proxies,
+                    timeout=10,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                if data:
+                    markets.extend(data)
+            except Exception as e:
+                logger.debug(f"[PNL] Error fetching closed {cid[:12]}: {e}")
         try:
             for m in markets:
                 cid = m.get("conditionId") or m.get("condition_id", "")
@@ -144,7 +165,35 @@ class PnLTracker:
                 except (IndexError, TypeError, ValueError):
                     yes_price = None
 
-                is_resolved = closed and yes_price is not None and (yes_price >= 0.99 or yes_price <= 0.01)
+                # Asumir resuelto si:
+                # (a) Gamma marca closed=True con precio extremo, O
+                # (b) end_date ya paso hace mas de 12h y el precio es extremo
+                # (Gamma API tarda dias/semanas en actualizar closed=True post-resolucion)
+                end_past_12h = False
+                if end_date:
+                    try:
+                        edt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+                        if edt.tzinfo is None:
+                            edt = edt.replace(tzinfo=timezone.utc)
+                        hours_past = (datetime.now(timezone.utc) - edt).total_seconds() / 3600
+                        end_past_12h = hours_past > 12
+                    except Exception:
+                        pass
+
+                extreme_price = yes_price is not None and (yes_price >= 0.99 or yes_price <= 0.01)
+                # Si end_date pasó hace >24h, relajar el umbral a 0.97/0.03
+                # (precio post-resolución puede no ir exactamente a 1.00 si hay liquidez residual)
+                hours_past = 0
+                if end_date:
+                    try:
+                        edt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+                        if edt.tzinfo is None:
+                            edt = edt.replace(tzinfo=timezone.utc)
+                        hours_past = (datetime.now(timezone.utc) - edt).total_seconds() / 3600
+                    except Exception:
+                        pass
+                near_extreme = yes_price is not None and (yes_price >= 0.97 or yes_price <= 0.03)
+                is_resolved = (extreme_price and (closed or end_past_12h)) or (near_extreme and hours_past > 24)
 
                 if is_resolved:
                     yes_exit = yes_price
@@ -273,8 +322,8 @@ class PnLTracker:
 
         console.print(table)
 
-        # Tabla por trade individual
-        det = Table(title="Trades", box=box.SIMPLE, show_header=True)
+        # Tabla por trade individual — solo posiciones abiertas
+        det = Table(title="Posiciones Abiertas", box=box.SIMPLE, show_header=True)
         det.add_column("Señal",    style="dim",          no_wrap=True, max_width=14)
         det.add_column("Mercado",  style="white",        max_width=38)
         det.add_column("Lado",     justify="center",     no_wrap=True)
@@ -287,9 +336,14 @@ class PnLTracker:
 
         clv_total = 0.0
         clv_count = 0
+        open_rows = 0
 
-        for t in sorted(trades, key=lambda x: self._state.get(x["condition_id"], {}).get("end_date", "9999")):
+        for t in sorted(trades, key=lambda x: x.get("executed_at", "")):
             pnl, status = self._calc_pnl(t)
+            if status != "open":
+                # Los cerrados siguen contando en CLV si aplica, pero no se listan
+                continue
+            open_rows += 1
             state       = self._state.get(t["condition_id"], {})
             end_date    = state.get("end_date", "")
             side        = t["side"]
@@ -337,13 +391,36 @@ class PnLTracker:
                 estado,
                 cierre,
             )
-        console.print(det)
+        if open_rows > 0:
+            console.print(det)
+        else:
+            console.print("[dim]  Sin posiciones abiertas.[/dim]")
 
-        if clv_count > 0:
-            avg_clv = clv_total / clv_count
+        # CLV promedio calculado sobre TODOS los trades resueltos (no solo abiertos)
+        clv_all_total = 0.0
+        clv_all_count = 0
+        for t in trades:
+            _, st = self._calc_pnl(t)
+            if st not in ("won", "lost"):
+                continue
+            state_t = self._state.get(t["condition_id"], {})
+            closing_p = state_t.get("closing_price")
+            if closing_p is None:
+                continue
+            if t["side"] == "YES":
+                clv = closing_p - t["price"]
+            elif t["side"] == "NO":
+                clv = t["price"] - closing_p
+            else:
+                continue
+            clv_all_total += clv
+            clv_all_count += 1
+
+        if clv_all_count > 0:
+            avg_clv = clv_all_total / clv_all_count
             clv_color = "green" if avg_clv >= 0 else "red"
             console.print(
-                f"[dim]  CLV promedio ({clv_count} trades resueltos): "
+                f"[dim]  CLV promedio ({clv_all_count} trades resueltos): "
                 f"[{clv_color}]{avg_clv:+.4f}[/{clv_color}] "
                 f"({'edge real confirmado' if avg_clv > 0 else 'revisar senales'})[/dim]"
             )
@@ -426,6 +503,13 @@ class PnLTracker:
             reader = csv.DictReader(f)
             for row in reader:
                 try:
+                    price = float(row.get("price", 0) or 0)
+                    # Ignorar trades GTC fantasma a precios extremos que nunca se fillearon
+                    # (pre-reforma FOK/FAK). success=True pero el CLOB nunca matchó contraparte.
+                    # Estos eran BTC binaries legacy donde el bot ponía limit orders a $0.001-0.005
+                    # que se aceptaban pero no se ejecutaban.
+                    if price > 0 and price < 0.05:
+                        continue
                     trades.append({
                         "executed_at":  row.get("executed_at", ""),
                         "dry_run":      row.get("dry_run", "True").strip().lower() == "true",
@@ -435,7 +519,7 @@ class PnLTracker:
                         "token_id":     row.get("token_id", ""),
                         "question":     row.get("question", ""),
                         "side":         row.get("side", "YES"),
-                        "price":        float(row.get("price", 0) or 0),
+                        "price":        price,
                         "size_tokens":  float(row.get("size_tokens", 0) or 0),
                         "position_usd": float(row.get("position_usd", 0) or 0),
                         "edge":         float(row.get("edge", 0) or 0),
